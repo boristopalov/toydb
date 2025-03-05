@@ -1,5 +1,12 @@
 package raft
 
+import (
+	"bytes"
+	"errors"
+	"math/rand"
+	"time"
+)
+
 // AppendEntriesArgs contains the arguments for the AppendEntries RPC
 type AppendEntriesArgs struct {
 	Term         int        // Leader's election term
@@ -18,7 +25,7 @@ type AppendEntriesReply struct {
 }
 
 // AppendEntries handles the AppendEntries RPC from a leader
-func (node *RaftNode) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+func (node *RaftNode) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) error {
 	node.mu.Lock()
 	defer node.mu.Unlock()
 
@@ -28,7 +35,7 @@ func (node *RaftNode) AppendEntries(args *AppendEntriesArgs, reply *AppendEntrie
 
 	// 1. Reply false if term < currentTerm (§5.1)
 	if args.Term < node.currentTerm {
-		return false
+		return errors.New("term is less than current term")
 	}
 
 	// If RPC request contains term higher than currentTerm,
@@ -40,7 +47,8 @@ func (node *RaftNode) AppendEntries(args *AppendEntriesArgs, reply *AppendEntrie
 		node.storage.SaveState(node.currentTerm, node.votedFor)
 	}
 
-	// TODO: Reset election timeout since we received a valid AppendEntries from the leader
+	// Reset election timeout since we received a valid AppendEntries from the leader
+	node.timeout = time.Duration(rand.Intn(150)+150) * time.Millisecond // 150ms to 300ms
 
 	// 2. Reply false if log doesn't contain an entry at prevLogIndex
 	// whose term matches prevLogTerm (§5.3)
@@ -49,10 +57,12 @@ func (node *RaftNode) AppendEntries(args *AppendEntriesArgs, reply *AppendEntrie
 		if args.PrevLogIndex >= len(node.log) {
 			// Log is too short
 			reply.NextIndex = len(node.log)
-			return false
+			return errors.New("log is too short")
 		}
 
 		// Check if terms match at prevLogIndex
+		// This is not required for the protocol and is an optimization
+		// Follower provides a hint for which index the leader should try next
 		if node.log[args.PrevLogIndex].Term != args.PrevLogTerm {
 			// Terms don't match, suggest a new nextIndex
 			// Find the first index of the conflicting term
@@ -62,7 +72,7 @@ func (node *RaftNode) AppendEntries(args *AppendEntriesArgs, reply *AppendEntrie
 				index--
 			}
 			reply.NextIndex = index + 1
-			return false
+			return errors.New("terms don't match")
 		}
 	}
 
@@ -79,8 +89,8 @@ func (node *RaftNode) AppendEntries(args *AppendEntriesArgs, reply *AppendEntrie
 			continue
 		}
 
-		// If terms don't match, truncate log and append new entries
-		if node.log[logIndex].Term != entry.Term {
+		// If terms don't match or commands differ, truncate log and append new entries
+		if node.log[logIndex].Term != entry.Term || !bytes.Equal(node.log[logIndex].Command, entry.Command) {
 			node.log = node.log[:logIndex]
 			newEntries = append(newEntries, args.Entries[i:]...)
 			break
@@ -103,7 +113,7 @@ func (node *RaftNode) AppendEntries(args *AppendEntriesArgs, reply *AppendEntrie
 	}
 
 	reply.Success = true
-	return true
+	return nil
 }
 
 // SendAppendEntries is called by the leader to send AppendEntries RPCs to followers

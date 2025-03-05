@@ -26,7 +26,7 @@ func TestAppendEntriesBasic(t *testing.T) {
 	err := follower.AppendEntries(args, reply)
 
 	// Verify results
-	if err != nil {
+	if !reply.Success {
 		t.Errorf("AppendEntries returned error: %v", err)
 	}
 
@@ -66,7 +66,7 @@ func TestAppendEntriesWithEntries(t *testing.T) {
 	err := follower.AppendEntries(args, reply)
 
 	// Verify results
-	if err != nil {
+	if !reply.Success {
 		t.Errorf("AppendEntries returned error: %v", err)
 	}
 
@@ -115,12 +115,8 @@ func TestAppendEntriesLogInconsistency(t *testing.T) {
 	err := follower.AppendEntries(args, reply)
 
 	// Verify results
-	if err != nil {
-		t.Errorf("AppendEntries returned error: %v", err)
-	}
-
 	if !reply.Success {
-		t.Errorf("AppendEntries should succeed after resolving conflict")
+		t.Errorf("AppendEntries returned error: %v", err)
 	}
 
 	if len(follower.log) != 4 {
@@ -129,7 +125,7 @@ func TestAppendEntriesLogInconsistency(t *testing.T) {
 
 	// Verify the conflicting entry was replaced
 	if string(follower.log[2].Command) != "command2-leader" {
-		t.Errorf("Conflicting entry was not replaced correctly")
+		t.Errorf("Conflicting entry was not replaced correctly, got %s", string(follower.log[2].Command))
 	}
 
 	if follower.commitIndex != 3 {

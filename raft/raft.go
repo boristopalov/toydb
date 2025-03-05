@@ -1,7 +1,9 @@
 package raft
 
 import (
+	"math/rand"
 	"sync"
+	"time"
 )
 
 // NodeRole represents the state of a Raft node
@@ -42,6 +44,7 @@ type RaftNode struct {
 	id      string
 	peers   []string
 	storage Storage
+	timeout time.Duration
 }
 
 // Storage interface defines how Raft interacts with persistent storage
@@ -67,6 +70,7 @@ func NewRaftNode(id string, peers []string, storage Storage) *RaftNode {
 		lastApplied: 0,
 		nextIndex:   make(map[string]int),
 		matchIndex:  make(map[string]int),
+		timeout:     time.Duration(rand.Intn(150)+150) * time.Millisecond, // 150ms to 300ms
 	}
 
 	// Load persistent state if available
