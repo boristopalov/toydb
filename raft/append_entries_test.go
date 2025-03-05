@@ -1,13 +1,15 @@
 package raft
 
 import (
+	"log/slog"
 	"testing"
 )
 
 func TestAppendEntriesBasic(t *testing.T) {
 	// Create a follower node
 	storage := &MockStorage{}
-	follower := NewRaftNode("follower1", []string{"leader1"}, storage)
+	logger := slog.Default()
+	follower := NewRaftNode("follower1", []string{"leader1"}, storage, logger)
 	follower.currentTerm = 1
 
 	// Create a simple AppendEntries request (heartbeat)
@@ -42,7 +44,8 @@ func TestAppendEntriesBasic(t *testing.T) {
 func TestAppendEntriesWithEntries(t *testing.T) {
 	// Create a follower node
 	storage := &MockStorage{}
-	follower := NewRaftNode("follower1", []string{"leader1"}, storage)
+	logger := slog.Default()
+	follower := NewRaftNode("follower1", []string{"leader1"}, storage, logger)
 	follower.currentTerm = 1
 
 	// Create an AppendEntries request with entries
@@ -86,7 +89,8 @@ func TestAppendEntriesWithEntries(t *testing.T) {
 func TestAppendEntriesLogInconsistency(t *testing.T) {
 	// Create a follower node with existing log
 	storage := &MockStorage{}
-	follower := NewRaftNode("follower1", []string{"leader1"}, storage)
+	logger := slog.Default()
+	follower := NewRaftNode("follower1", []string{"leader1"}, storage, logger)
 	follower.currentTerm = 2
 	follower.log = []LogEntry{
 		{Term: 1, Index: 0, Command: []byte("command0")},

@@ -1,10 +1,19 @@
 package raft
 
 import (
-	"math/rand"
+	"log/slog"
 	"sync"
-	"time"
 )
+
+// RaftNodeInterface combines all the interfaces that a RaftNode should implement
+// TODO: Test this
+type RaftNode interface {
+	RequestVoter
+	AppendEntriesSender
+	ElectionHandler
+	Start()
+	Stop()
+}
 
 // NodeRole represents the state of a Raft node
 type NodeRole int
@@ -23,7 +32,7 @@ type LogEntry struct {
 }
 
 // RaftNode represents a node in the Raft cluster
-type RaftNode struct {
+type raftNode struct {
 	mu sync.Mutex
 
 	// Persistent state
@@ -44,21 +53,23 @@ type RaftNode struct {
 	id      string
 	peers   []string
 	storage Storage
-	timeout time.Duration
-}
 
-// Storage interface defines how Raft interacts with persistent storage
-type Storage interface {
-	SaveState(term int, votedFor string) error
-	LoadState() (term int, votedFor string, err error)
+	rpcClient *RaftRPCClient
+	rpcServer *RaftRPCServer
 
-	AppendLogEntries(entries []LogEntry) error
-	GetLogEntries(startIndex, endIndex int) ([]LogEntry, error)
+	// Election timer channels
+	resetChan chan struct{} // Signal to reset election timer
+	stopChan  chan struct{} // Signal to stop election timer
+
+	// Running state
+	running bool
+
+	logger *slog.Logger
 }
 
 // NewRaftNode creates a new Raft node
-func NewRaftNode(id string, peers []string, storage Storage) *RaftNode {
-	node := &RaftNode{
+func NewRaftNode(id string, peers []string, storage Storage, logger *slog.Logger) *raftNode {
+	node := &raftNode{
 		id:          id,
 		peers:       peers,
 		storage:     storage,
@@ -70,7 +81,10 @@ func NewRaftNode(id string, peers []string, storage Storage) *RaftNode {
 		lastApplied: 0,
 		nextIndex:   make(map[string]int),
 		matchIndex:  make(map[string]int),
-		timeout:     time.Duration(rand.Intn(150)+150) * time.Millisecond, // 150ms to 300ms
+		resetChan:   make(chan struct{}, 1), // Buffer of 1 to avoid blocking
+		stopChan:    make(chan struct{}),
+		running:     false,
+		logger:      logger,
 	}
 
 	// Load persistent state if available
@@ -81,4 +95,42 @@ func NewRaftNode(id string, peers []string, storage Storage) *RaftNode {
 	}
 
 	return node
+}
+
+// Start starts the Raft node
+func (node *raftNode) Start() {
+	node.mu.Lock()
+	defer node.mu.Unlock()
+
+	if node.running {
+		return
+	}
+
+	node.running = true
+
+	// Start election timer
+	go node.startElectionTimer()
+}
+
+// Stop stops the Raft node
+func (node *raftNode) Stop() {
+	node.mu.Lock()
+	defer node.mu.Unlock()
+
+	if !node.running {
+		return
+	}
+
+	node.running = false
+
+	// Signal all goroutines to stop
+	close(node.stopChan)
+
+	// Create new channels for next start
+	node.resetChan = make(chan struct{}, 1)
+	node.stopChan = make(chan struct{})
+}
+
+func (node *raftNode) GetId() string {
+	return node.id
 }

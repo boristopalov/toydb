@@ -3,9 +3,12 @@ package raft
 import (
 	"bytes"
 	"errors"
-	"math/rand"
-	"time"
 )
+
+type AppendEntriesSender interface {
+	AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) error
+	SendAppendEntries(peerId string) bool
+}
 
 // AppendEntriesArgs contains the arguments for the AppendEntries RPC
 type AppendEntriesArgs struct {
@@ -25,7 +28,7 @@ type AppendEntriesReply struct {
 }
 
 // AppendEntries handles the AppendEntries RPC from a leader
-func (node *RaftNode) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) error {
+func (node *raftNode) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) error {
 	node.mu.Lock()
 	defer node.mu.Unlock()
 
@@ -48,7 +51,7 @@ func (node *RaftNode) AppendEntries(args *AppendEntriesArgs, reply *AppendEntrie
 	}
 
 	// Reset election timeout since we received a valid AppendEntries from the leader
-	node.timeout = time.Duration(rand.Intn(150)+150) * time.Millisecond // 150ms to 300ms
+	node.resetElectionTimeout()
 
 	// 2. Reply false if log doesn't contain an entry at prevLogIndex
 	// whose term matches prevLogTerm (§5.3)
@@ -117,7 +120,7 @@ func (node *RaftNode) AppendEntries(args *AppendEntriesArgs, reply *AppendEntrie
 }
 
 // SendAppendEntries is called by the leader to send AppendEntries RPCs to followers
-func (node *RaftNode) SendAppendEntries(peerId string) bool {
+func (node *raftNode) SendAppendEntries(peerId string) bool {
 	node.mu.Lock()
 
 	// Only leaders can send AppendEntries
@@ -154,8 +157,8 @@ func (node *RaftNode) SendAppendEntries(peerId string) bool {
 	reply := &AppendEntriesReply{}
 
 	// Simulate RPC call (in a real implementation, this would be a network call)
-	// For now, we'll just return false to indicate failure
-	success := false
+	// For now, we'll just return true to indicate success
+	success := true
 
 	// Process reply
 	if success {
