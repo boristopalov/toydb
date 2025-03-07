@@ -2,6 +2,7 @@ package raft
 
 import (
 	"math/rand"
+	"sync/atomic"
 	"time"
 )
 
@@ -55,22 +56,24 @@ func (node *raftNode) StartElection() {
 	node.logger.Info("Starting election", "term", node.currentTerm)
 
 	// Transition to candidate
-	node.role = Candidate
-	node.currentTerm++
-	node.votedFor = node.id // Vote for self
-	node.storage.SaveState(node.currentTerm, node.votedFor)
+	node.role = Candidate                                   // Transition to candidate role
+	node.currentTerm++                                      // Increment term
+	node.votedFor = node.id                                 // Vote for self
+	node.storage.SaveState(node.currentTerm, node.votedFor) // Persist incremented term and vote for self
 
 	node.logger.Info("Became candidate", "term", node.currentTerm, "id", node.id)
 
 	// Prepare for vote collection
 	term := node.currentTerm
 	// Track votes received (starting with our own vote)
-	votesReceived := 1
+	var votesReceived atomic.Int32 // thread-safe since this uses atomic hardware instructions
+	votesReceived.Store(1)
+
 	neededVotes := (len(node.peers)+1)/2 + 1 // Majority
 
 	node.mu.Unlock()
 
-	// Request votes from all peers
+	// Send RequestVote RPCs to all peers
 	for _, peerId := range node.peers {
 		node.logger.Info("Requesting vote from", "peer", peerId)
 		go func(peer string) {
@@ -100,10 +103,10 @@ func (node *raftNode) StartElection() {
 				}
 
 				// If vote was granted
-				votesReceived++
+				newVotes := votesReceived.Add(1)
 
 				// Check if we have majority
-				if votesReceived >= neededVotes {
+				if newVotes >= int32(neededVotes) {
 					node.logger.Info("Received majority of votes, becoming leader")
 					node.BecomeLeader()
 				}
@@ -132,45 +135,4 @@ func (node *raftNode) BecomeLeader() {
 // Helper function to generate random election timeout
 func randomElectionTimeout() time.Duration {
 	return time.Duration(rand.Intn(150)+150) * time.Millisecond // 150-300ms
-}
-
-// Update the SendRequestVote method to use our RPC client
-func (node *raftNode) SendRequestVote(peerID string) bool {
-	node.mu.Lock()
-
-	// Prepare request
-	lastLogIndex := len(node.log) - 1
-	var lastLogTerm uint64 = 0
-	if lastLogIndex >= 0 {
-		lastLogTerm = node.log[lastLogIndex].Term
-	}
-
-	req := &RequestVoteRequest{
-		Term:         int64(node.currentTerm),
-		CandidateId:  node.id,
-		LastLogIndex: int64(lastLogIndex),
-		LastLogTerm:  int64(lastLogTerm),
-	}
-
-	node.mu.Unlock()
-
-	// Send RPC
-	reply, err := node.rpcClient.SendRequestVote(peerID, req)
-	if err != nil {
-		node.logger.Error("Failed to send RequestVote", "peer", peerID, "error", err)
-		return false
-	}
-
-	node.mu.Lock()
-	defer node.mu.Unlock()
-
-	// Process reply
-	if uint64(reply.Term) > node.currentTerm {
-		node.currentTerm = uint64(reply.Term)
-		node.role = Follower
-		node.votedFor = ""
-		node.storage.SaveState(node.currentTerm, node.votedFor)
-	}
-
-	return reply.VoteGranted
 }

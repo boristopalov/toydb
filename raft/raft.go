@@ -18,6 +18,10 @@ type RaftNode interface {
 // NodeRole represents the state of a Raft node
 type NodeRole int
 
+func (r NodeRole) String() string {
+	return []string{"Follower", "Candidate", "Leader"}[r]
+}
+
 const (
 	Follower NodeRole = iota
 	Candidate

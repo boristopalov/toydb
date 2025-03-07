@@ -81,7 +81,7 @@ func TestElectionBasic(t *testing.T) {
 	node1.mu.Unlock()
 
 	if role1 != Leader {
-		t.Errorf("Expected node1 to become leader, but got role %v", role1)
+		t.Errorf("Expected node1 to have role Leader, but got role %v", role1)
 	}
 
 	if term1 != 1 {
