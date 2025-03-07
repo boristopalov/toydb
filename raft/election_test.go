@@ -58,9 +58,9 @@ func TestElectionBasic(t *testing.T) {
 
 	// Create three nodes
 	logger := slog.Default()
-	node1 := NewRaftNode("node1", []string{"node2", "node3"}, storage1, logger)
-	node2 := NewRaftNode("node2", []string{"node1", "node3"}, storage2, logger)
-	node3 := NewRaftNode("node3", []string{"node1", "node2"}, storage3, logger)
+	node1 := NewRaftNode("node1", "8080", []string{"node2", "node3"}, storage1, logger)
+	node2 := NewRaftNode("node2", "8081", []string{"node1", "node3"}, storage2, logger)
+	node3 := NewRaftNode("node3", "8082", []string{"node1", "node2"}, storage3, logger)
 
 	// Create a mock network
 	network := NewMockRaftNetwork()
@@ -122,9 +122,9 @@ func TestElectionWithDisconnection(t *testing.T) {
 
 	// Create three nodes
 	logger := slog.Default()
-	node1 := NewRaftNode("node1", []string{"node2", "node3"}, storage1, logger)
-	node2 := NewRaftNode("node2", []string{"node1", "node3"}, storage2, logger)
-	node3 := NewRaftNode("node3", []string{"node1", "node2"}, storage3, logger)
+	node1 := NewRaftNode("node1", "8080", []string{"node2", "node3"}, storage1, logger)
+	node2 := NewRaftNode("node2", "8081", []string{"node1", "node3"}, storage2, logger)
+	node3 := NewRaftNode("node3", "8082", []string{"node1", "node2"}, storage3, logger)
 
 	// Create a mock network
 	network := NewMockRaftNetwork()
@@ -200,7 +200,7 @@ func TestElectionTimeout(t *testing.T) {
 	// Create a mock storage implementation
 	storage := &MockStorage{}
 	logger := slog.Default()
-	node := NewRaftNode("node1", []string{"node2", "node3"}, storage, logger)
+	node := NewRaftNode("node1", "8080", []string{"node2", "node3"}, storage, logger)
 
 	// Start the node
 	node.Start()
@@ -231,7 +231,7 @@ func TestElectionResetTimeout(t *testing.T) {
 	// Create a mock storage implementation
 	storage := &MockStorage{}
 	logger := slog.Default()
-	node := NewRaftNode("node1", []string{"node2"}, storage, logger)
+	node := NewRaftNode("node1", "8080", []string{"node2"}, storage, logger)
 
 	// Create a channel to track when startElection is called
 	electionStarted := make(chan struct{}, 1)

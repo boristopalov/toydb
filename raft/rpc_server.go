@@ -1,6 +1,7 @@
 package raft
 
 import (
+	"fmt"
 	"log/slog"
 	"net"
 	"net/rpc"
@@ -8,6 +9,7 @@ import (
 )
 
 // RaftRPC is the RPC handler for Raft operations
+// This is used to register the RPC handler with the RPC server
 type RaftRPC struct {
 	node   *raftNode
 	logger *slog.Logger
@@ -26,7 +28,8 @@ type RaftRPCServer struct {
 }
 
 // NewRaftRPCServer creates a new RPC server for a Raft node
-func NewRaftRPCServer(node *raftNode, addr string, logger *slog.Logger) *RaftRPCServer {
+func NewRaftRPCServer(node *raftNode, port string, logger *slog.Logger) *RaftRPCServer {
+	addr := fmt.Sprintf(":%s", port)
 	return &RaftRPCServer{
 		node:    node,
 		addr:    addr,

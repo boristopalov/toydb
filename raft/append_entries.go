@@ -131,7 +131,7 @@ func (node *raftNode) SendAppendEntries(peerId string) bool {
 	}
 
 	// Prepare arguments
-	prevLogIndex := max(node.nextIndex[peerId]-1, 0)
+	prevLogIndex := node.nextIndex[peerId] - 1
 	prevLogTerm := 0
 	if prevLogIndex > 0 && prevLogIndex < len(node.log) {
 		prevLogTerm = node.log[prevLogIndex].Term
