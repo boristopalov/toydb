@@ -53,7 +53,7 @@ func (node *raftNode) StartElection() {
 		return
 	}
 
-	node.logger.Info("Starting election", "term", node.currentTerm)
+	node.logger.Info("Starting election", "electionInitiator", node.id)
 
 	// Transition to candidate
 	node.role = Candidate                                   // Transition to candidate role
@@ -75,26 +75,26 @@ func (node *raftNode) StartElection() {
 
 	// Send RequestVote RPCs to all peers
 	for _, peerId := range node.peers {
-		node.logger.Info("Requesting vote from", "peer", peerId)
+		node.logger.Info("Requesting vote from peer", "node", node.id, "peer", peerId)
 		go func(peer string) {
 			reply := &RequestVoteReply{}
 
 			// Send RequestVote RPC
 			success := node.SendRequestVote(peer)
-			node.logger.Info("Received vote from", "peer", peer, "success", success)
+			node.logger.Info("Received vote from peer", "node", node.id, "peer", peer, "success", success)
 			if success {
 				node.mu.Lock()
 				defer node.mu.Unlock()
 
 				// If we're no longer a candidate or term has changed, ignore reply
 				if node.role != Candidate || node.currentTerm != term {
-					node.logger.Info("Ignoring vote from", "peer", peer, "reason", "not a candidate or term has changed")
+					node.logger.Info("Ignoring vote from peer", "node", node.id, "peer", peer, "reason", "not a candidate or term has changed")
 					return
 				}
 
 				// If we discovered a new term, convert to follower
 				if reply.Term > node.currentTerm {
-					node.logger.Info("Converting to follower due to new term", "peer", peer, "new term", reply.Term)
+					node.logger.Info("Converting to follower due to new term", "node", node.id, "peer", peer, "new term", reply.Term)
 					node.currentTerm = reply.Term
 					node.role = Follower
 					node.votedFor = ""
@@ -105,9 +105,9 @@ func (node *raftNode) StartElection() {
 				// If vote was granted
 				newVotes := votesReceived.Add(1)
 
-				// Check if we have majority
-				if newVotes >= int32(neededVotes) {
-					node.logger.Info("Received majority of votes, becoming leader")
+				// Check if we have majority and are still a candidate in the same term
+				if newVotes >= int32(neededVotes) && node.role == Candidate && node.currentTerm == term {
+					node.logger.Info("Received majority of votes, becoming leader", "node", node.id)
 					node.BecomeLeader()
 				}
 			}
@@ -119,7 +119,7 @@ func (node *raftNode) StartElection() {
 func (node *raftNode) BecomeLeader() {
 	// Initialize leader state
 	for _, peerId := range node.peers {
-		node.nextIndex[peerId] = len(node.log)
+		node.nextIndex[peerId] = len(node.log) // not sure if this is correct
 		node.matchIndex[peerId] = 0
 	}
 

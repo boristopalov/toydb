@@ -80,7 +80,7 @@ func NewRaftNode(id string, peers []string, storage Storage, logger *slog.Logger
 		role:        Follower,
 		currentTerm: 0,
 		votedFor:    "",
-		log:         []LogEntry{},
+		log:         make([]LogEntry, 0),
 		commitIndex: 0,
 		lastApplied: 0,
 		nextIndex:   make(map[string]int),
@@ -103,6 +103,7 @@ func NewRaftNode(id string, peers []string, storage Storage, logger *slog.Logger
 
 // Start starts the Raft node
 func (node *raftNode) Start() {
+	node.logger.Info("Starting Raft node", "id", node.id)
 	node.mu.Lock()
 	defer node.mu.Unlock()
 

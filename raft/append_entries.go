@@ -13,7 +13,7 @@ type AppendEntriesSender interface {
 // AppendEntriesArgs contains the arguments for the AppendEntries RPC
 type AppendEntriesArgs struct {
 	Term         int        // Leader's election term
-	LeaderId     string     // So follower can redirect clients
+	LeaderId     string     // So follower can redirect clients to the leader
 	PrevLogIndex int        // Index of log entry immediately preceding new ones
 	PrevLogTerm  int        // Election term of prevLogIndex entry
 	Entries      []LogEntry // Log entries to store (empty for heartbeat)
@@ -121,6 +121,7 @@ func (node *raftNode) AppendEntries(args *AppendEntriesArgs, reply *AppendEntrie
 
 // SendAppendEntries is called by the leader to send AppendEntries RPCs to followers
 func (node *raftNode) SendAppendEntries(peerId string) bool {
+	node.logger.Info("Sending AppendEntries to peer", "node", node.id, "peer", peerId)
 	node.mu.Lock()
 
 	// Only leaders can send AppendEntries
@@ -130,7 +131,7 @@ func (node *raftNode) SendAppendEntries(peerId string) bool {
 	}
 
 	// Prepare arguments
-	prevLogIndex := node.nextIndex[peerId] - 1
+	prevLogIndex := max(node.nextIndex[peerId]-1, 0)
 	prevLogTerm := 0
 	if prevLogIndex > 0 && prevLogIndex < len(node.log) {
 		prevLogTerm = node.log[prevLogIndex].Term

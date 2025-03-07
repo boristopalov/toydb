@@ -83,7 +83,7 @@ func (node *raftNode) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply
 
 // SendRequestVote is called by a candidate to send RequestVote RPCs to peers
 func (node *raftNode) SendRequestVote(peerId string) bool {
-	node.logger.Info("Sending vote request to", "peer", peerId)
+	node.logger.Info("Sending vote request to peer", "node", node.id, "peer", peerId)
 	node.mu.Lock()
 
 	// Only candidates can request votes
@@ -126,13 +126,13 @@ func (node *raftNode) SendRequestVote(peerId string) bool {
 
 		// If we're no longer a candidate or term has changed, ignore reply
 		if node.role != Candidate || node.currentTerm != args.Term {
-			node.logger.Info("Ignoring vote request from", "peer", peerId, "reason", "not a candidate or term has changed")
+			node.logger.Info("Ignoring vote request from peer", "node", node.id, "peer", peerId, "reason", "not a candidate or term has changed")
 			return false
 		}
 
 		// If we discovered a new term, convert to follower
 		if reply.Term > node.currentTerm {
-			node.logger.Info("Converting to follower due to new term", "peer", peerId, "new term", reply.Term)
+			node.logger.Info("Converting to follower due to new term", "node", node.id, "new term", reply.Term)
 			node.currentTerm = reply.Term
 			node.role = Follower
 			node.votedFor = ""
