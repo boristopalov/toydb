@@ -21,7 +21,7 @@ type RaftRPCServer struct {
 	rpcImpl  *RaftRPC
 	server   *rpc.Server
 	listener net.Listener
-	addr     string
+	port     string
 	logger   *slog.Logger
 	mu       sync.Mutex
 	running  bool
@@ -29,10 +29,9 @@ type RaftRPCServer struct {
 
 // NewRaftRPCServer creates a new RPC server for a Raft node
 func NewRaftRPCServer(node *raftNode, port string, logger *slog.Logger) *RaftRPCServer {
-	addr := fmt.Sprintf(":%s", port)
 	return &RaftRPCServer{
 		node:    node,
-		addr:    addr,
+		port:    port,
 		logger:  logger,
 		running: false,
 	}
@@ -44,6 +43,7 @@ func (s *RaftRPCServer) Start() (string, error) {
 	defer s.mu.Unlock()
 
 	if s.running {
+		s.logger.Info("RPC server already running", "address", s.listener.Addr().String())
 		return s.listener.Addr().String(), nil
 	}
 
@@ -55,14 +55,17 @@ func (s *RaftRPCServer) Start() (string, error) {
 	}
 
 	// Register the RPC handler
-	err := s.server.RegisterName("RaftRPC", s.rpcImpl)
+	err := s.server.RegisterName("RaftServer", s.rpcImpl)
 	if err != nil {
+		s.logger.Error("Failed to register RPC handler", "error", err)
 		return "", err
 	}
 
 	// Create a listener
-	listener, err := net.Listen("tcp", s.addr)
+	addr := fmt.Sprintf("127.0.0.1:%s", s.port)
+	listener, err := net.Listen("tcp", addr)
 	if err != nil {
+		s.logger.Error("Failed to create listener", "error", err)
 		return "", err
 	}
 	s.listener = listener
@@ -107,12 +110,12 @@ func (s *RaftRPCServer) Stop() {
 
 // RequestVote handles the RequestVote RPC
 func (r *RaftRPC) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) error {
-	r.logger.Debug("Received RequestVote", "from", args.CandidateId, "term", args.Term)
+	r.logger.Info("Received RequestVote RPC SERVER", "from", args.CandidateId, "term", args.Term)
 	return r.node.RequestVote(args, reply)
 }
 
 // AppendEntries handles the AppendEntries RPC
 func (r *RaftRPC) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) error {
-	r.logger.Debug("Received AppendEntries", "from", args.LeaderId, "term", args.Term)
+	r.logger.Info("Received AppendEntries RPC SERVER", "from", args.LeaderId, "term", args.Term)
 	return r.node.AppendEntries(args, reply)
 }

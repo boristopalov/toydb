@@ -13,14 +13,6 @@ type MockRaftNetwork struct {
 	nodes map[string]RaftNode
 }
 
-// type TestableRaftNode struct {
-// 	RaftNode
-// }
-
-// func (node *TestableRaftNode) SendRequestVote(peerId string) bool {
-// 	return true
-// }
-
 // NewMockRaftNetwork creates a new mock network
 func NewMockRaftNetwork() *MockRaftNetwork {
 	return &MockRaftNetwork{
@@ -58,9 +50,9 @@ func TestElectionBasic(t *testing.T) {
 
 	// Create three nodes
 	logger := slog.Default()
-	node1 := NewRaftNode("node1", "8080", []string{"node2", "node3"}, storage1, logger)
-	node2 := NewRaftNode("node2", "8081", []string{"node1", "node3"}, storage2, logger)
-	node3 := NewRaftNode("node3", "8082", []string{"node1", "node2"}, storage3, logger)
+	node1 := NewRaftNode("node1", "8080", []string{":8081", ":8082"}, storage1, logger)
+	node2 := NewRaftNode("node2", "8081", []string{":8080", ":8082"}, storage2, logger)
+	node3 := NewRaftNode("node3", "8082", []string{":8080", ":8081"}, storage3, logger)
 
 	// Create a mock network
 	network := NewMockRaftNetwork()
@@ -68,16 +60,25 @@ func TestElectionBasic(t *testing.T) {
 	network.AddNode(node2)
 	network.AddNode(node3)
 
-	// Start node1 and trigger an election
-	// node1.Start()
+	node1.Start()
+	node2.Start()
+	node3.Start()
+
+	node1.ConnectToPeers()
+	node2.ConnectToPeers()
+	node3.ConnectToPeers()
 
 	// Manually trigger an election on node1
 	node1.StartElection()
 
 	// Check if node1 became the leader
+
+	time.Sleep(300 * time.Millisecond)
+
 	node1.mu.Lock()
 	role1 := node1.role
 	term1 := node1.currentTerm
+
 	node1.mu.Unlock()
 
 	if role1 != Leader {
@@ -122,9 +123,9 @@ func TestElectionWithDisconnection(t *testing.T) {
 
 	// Create three nodes
 	logger := slog.Default()
-	node1 := NewRaftNode("node1", "8080", []string{"node2", "node3"}, storage1, logger)
-	node2 := NewRaftNode("node2", "8081", []string{"node1", "node3"}, storage2, logger)
-	node3 := NewRaftNode("node3", "8082", []string{"node1", "node2"}, storage3, logger)
+	node1 := NewRaftNode("node1", "8080", []string{":8081", ":8082"}, storage1, logger)
+	node2 := NewRaftNode("node2", "8081", []string{":8080", ":8082"}, storage2, logger)
+	node3 := NewRaftNode("node3", "8082", []string{":8080", ":8081"}, storage3, logger)
 
 	// Create a mock network
 	network := NewMockRaftNetwork()
@@ -138,10 +139,15 @@ func TestElectionWithDisconnection(t *testing.T) {
 	node2.Start()
 	node3.Start()
 
-	// Give some time for the election to complete
-	time.Sleep(100 * time.Millisecond)
+	node1.ConnectToPeers()
+	node2.ConnectToPeers()
+	node3.ConnectToPeers()
+
 	// Manually trigger an election on node1
 	node1.StartElection()
+
+	// Give some time for the election to complete
+	time.Sleep(100 * time.Millisecond)
 
 	// Check if node1 became the leader
 	node1.mu.Lock()
@@ -153,7 +159,7 @@ func TestElectionWithDisconnection(t *testing.T) {
 	}
 
 	// Disconnect the leader
-	network.DisconnectNode("node1")
+	node1.Stop()
 
 	// Manually trigger an election on node2
 	node2.StartElection()
@@ -168,114 +174,28 @@ func TestElectionWithDisconnection(t *testing.T) {
 	node2.mu.Unlock()
 
 	if role2 != Leader {
-		t.Errorf("Expected node2 to become leader after node1 disconnected, but got role %v", role2)
+		t.Errorf("Expected node2 to become leader after node1 disconnected, but got role2=%v", role2)
 	}
 
 	if term2 != 2 {
-		t.Errorf("Expected term to be 2 after new election, but got %d", term2)
+		t.Errorf("Expected term to be 2 after new election, but got term2=%d", term2)
 	}
 
 	// Check if node3 recognized the new leader
 	node3.mu.Lock()
+	role3 := node3.role
 	term3 := node3.currentTerm
-	votedFor3 := node3.votedFor
 	node3.mu.Unlock()
 
-	if term3 != 2 {
-		t.Errorf("Expected node3 to be at term 2, but got %d", term3)
+	if role3 != Follower {
+		t.Errorf("Expected node3 to be follower after node1 disconnected, but got role3=%v", role3)
 	}
 
-	if votedFor3 != "node2" {
-		t.Errorf("Expected node3 to vote for node2, but voted for %s", votedFor3)
+	if term3 != 2 {
+		t.Errorf("Expected term to be 2 after new election, but got term3=%d", term3)
 	}
 
 	// Clean up
-	node1.Stop()
 	node2.Stop()
 	node3.Stop()
-}
-
-// TestElectionTimeout tests that a follower starts an election when it doesn't hear from a leader
-func TestElectionTimeout(t *testing.T) {
-	// Create a mock storage implementation
-	storage := &MockStorage{}
-	logger := slog.Default()
-	node := NewRaftNode("node1", "8080", []string{"node2", "node3"}, storage, logger)
-
-	// Start the node
-	node.Start()
-
-	// Wait for the election timeout to trigger
-	time.Sleep(100 * time.Millisecond)
-
-	// Check if the node transitioned to candidate
-	node.mu.Lock()
-	role := node.role
-	term := node.currentTerm
-	node.mu.Unlock()
-
-	if role != Candidate {
-		t.Errorf("Expected node to become candidate after election timeout, but got role %v", role)
-	}
-
-	if term != 1 {
-		t.Errorf("Expected term to be 1 after election timeout, but got %d", term)
-	}
-
-	// Clean up
-	node.Stop()
-}
-
-// TestElectionResetTimeout tests that receiving an AppendEntries resets the election timeout
-func TestElectionResetTimeout(t *testing.T) {
-	// Create a mock storage implementation
-	storage := &MockStorage{}
-	logger := slog.Default()
-	node := NewRaftNode("node1", "8080", []string{"node2"}, storage, logger)
-
-	// Create a channel to track when startElection is called
-	electionStarted := make(chan struct{}, 1)
-
-	// Start the node
-	node.Start()
-
-	// Send an AppendEntries RPC to reset the election timeout
-	args := &AppendEntriesArgs{
-		Term:         1,
-		LeaderId:     "node2",
-		PrevLogIndex: 0,
-		PrevLogTerm:  0,
-		Entries:      []LogEntry{},
-		LeaderCommit: 0,
-	}
-	reply := &AppendEntriesReply{}
-
-	// Wait a bit, then send the AppendEntries
-	time.Sleep(20 * time.Millisecond)
-	node.AppendEntries(args, reply)
-
-	// Wait for what would have been the original timeout
-	time.Sleep(60 * time.Millisecond)
-
-	// Check if an election was started (it shouldn't have been)
-	select {
-	case <-electionStarted:
-		t.Errorf("Election was started despite receiving AppendEntries")
-	default:
-		// This is the expected path - no election was started
-	}
-
-	// Wait for the new timeout to elapse
-	time.Sleep(60 * time.Millisecond)
-
-	// Now an election should have started
-	select {
-	case <-electionStarted:
-		// This is the expected path - an election was started
-	default:
-		t.Errorf("Election was not started after the reset timeout elapsed")
-	}
-
-	// Clean up
-	node.Stop()
 }

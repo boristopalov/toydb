@@ -3,10 +3,15 @@ package raft
 import (
 	"log/slog"
 	"sync"
+	"time"
 )
 
+// TODO: command handler for leaders
+// command == leader appends the command to the log with current term
+// and then sends AppendEntries to all peers in parallel
+// if any peer rejects, leader retries with updated nextIndex for each peer
+
 // RaftNodeInterface combines all the interfaces that a RaftNode should implement
-// TODO: Test this
 type RaftNode interface {
 	RequestVoter
 	AppendEntriesSender
@@ -54,11 +59,12 @@ type raftNode struct {
 	matchIndex map[string]int // Highest index known to be replicated (not just sent), i.e. follower has accepted the entry to the leader
 
 	// Node information
-	id      string
-	peers   []string
-	storage Storage
+	id        string
+	peerAddrs []string
+	storage   Storage
 
 	peerClients map[string]RaftClient // RPC clients for each peer ID
+	port        string
 	rpcServer   *RaftRPCServer
 
 	// Election timer channels
@@ -72,10 +78,10 @@ type raftNode struct {
 }
 
 // NewRaftNode creates a new Raft node
-func NewRaftNode(id string, port string, peers []string, storage Storage, logger *slog.Logger) *raftNode {
+func NewRaftNode(id string, port string, peerAddrs []string, storage Storage, logger *slog.Logger) *raftNode {
 	node := &raftNode{
 		id:          id,
-		peers:       peers,
+		peerAddrs:   peerAddrs,
 		storage:     storage,
 		role:        Follower,
 		currentTerm: 0,
@@ -89,35 +95,18 @@ func NewRaftNode(id string, port string, peers []string, storage Storage, logger
 		stopChan:    make(chan struct{}),
 		peerClients: make(map[string]RaftClient),
 		running:     false,
+		port:        port,
 		logger:      logger,
-	}
-
-	rpcServer := NewRaftRPCServer(node, port, logger)
-	node.rpcServer = rpcServer
-
-	go rpcServer.Start()
-
-	for _, peer := range peers {
-		rpcClient, err := NewRaftRPCClient(peer, logger) // TODO: what to assign here hmm
-		if err != nil {
-			logger.Error("Failed to create RPC client", "error", err)
-			continue
-		}
-		node.peerClients[peer] = rpcClient
-	}
-
-	// Load persistent state if available
-	term, votedFor, err := storage.LoadState()
-	if err == nil {
-		node.currentTerm = term
-		node.votedFor = votedFor
 	}
 
 	return node
 }
 
-// Start starts the Raft node
+// Start starts the Raft node server and sets the node's state to running
 func (node *raftNode) Start() {
+	rpcServer := NewRaftRPCServer(node, node.port, node.logger)
+	node.rpcServer = rpcServer
+
 	node.logger.Info("Starting Raft node", "id", node.id)
 	node.mu.Lock()
 	defer node.mu.Unlock()
@@ -128,8 +117,33 @@ func (node *raftNode) Start() {
 
 	go node.rpcServer.Start()
 	node.running = true
+}
 
-	// Start election timer
+func (node *raftNode) ConnectToPeers() {
+	// Try 5 times to connect to each peer
+	for _, peerAddr := range node.peerAddrs {
+		for range 5 {
+			rpcClient, err := NewRaftRPCClient(peerAddr, node.logger)
+			if err != nil {
+				node.logger.Error("Failed to create RPC client", "node", node.id, "peerAddr", peerAddr, "error", err)
+				time.Sleep(200 * time.Millisecond)
+				continue
+			}
+			node.logger.Info("Connected to peer", "node", node.id, "peerAddr", peerAddr)
+			node.peerClients[peerAddr] = rpcClient
+
+			// Load persistent state if available
+			term, votedFor, err := node.storage.LoadState()
+			if err == nil {
+				node.currentTerm = term
+				node.votedFor = votedFor
+			}
+			break
+		}
+	}
+}
+
+func (node *raftNode) StartElectionTimer() {
 	go node.startElectionTimer()
 }
 
@@ -139,17 +153,17 @@ func (node *raftNode) Stop() {
 	defer node.mu.Unlock()
 
 	if !node.running {
+		node.logger.Info("Raft node already stopped", "id", node.id)
 		return
 	}
 
-	node.running = false
+	node.logger.Info("Stopping Raft node", "id", node.id)
 
 	// Signal all goroutines to stop
 	close(node.stopChan)
-
-	// Create new channels for next start
-	node.resetChan = make(chan struct{}, 1)
-	node.stopChan = make(chan struct{})
+	// Stop the RPC server
+	node.rpcServer.Stop()
+	node.running = false
 }
 
 func (node *raftNode) GetId() string {

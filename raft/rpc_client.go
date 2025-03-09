@@ -1,6 +1,7 @@
 package raft
 
 import (
+	"fmt"
 	"log/slog"
 	"net"
 	"net/rpc"
@@ -8,8 +9,8 @@ import (
 )
 
 type RaftClient interface {
-	RequestVote(args *RequestVoteArgs) (*RequestVoteReply, error)
-	AppendEntries(args *AppendEntriesArgs) (*AppendEntriesReply, error)
+	SendRequestVote(args *RequestVoteArgs) (*RequestVoteReply, error)
+	SendAppendEntries(args *AppendEntriesArgs) (*AppendEntriesReply, error)
 }
 
 // RaftRPCClient manages outbound RPC connections to other Raft nodes
@@ -22,27 +23,32 @@ type rpcClient struct {
 }
 
 // NewRaftRPCClient creates a new RPC client for a Raft node
-func NewRaftRPCClient(addr net.Addr, logger *slog.Logger) (RaftClient, error) {
-	client, err := rpc.Dial("tcp", addr.String())
+func NewRaftRPCClient(addr string, logger *slog.Logger) (RaftClient, error) {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return nil, err
+	}
+	endpoint := fmt.Sprintf("%s:%s", host, port)
+	client, err := rpc.Dial("tcp", endpoint)
 	if err != nil {
 		return nil, err
 	}
 	return &rpcClient{
-		endpoint:     addr.String(),
+		endpoint:     addr,
 		client:       client,
 		logger:       logger,
 		dialTimeout:  5 * time.Second,
 		retryBackoff: 1 * time.Second}, nil
 }
 
-func (rc *rpcClient) RequestVote(args *RequestVoteArgs) (*RequestVoteReply, error) {
+func (rc *rpcClient) SendRequestVote(args *RequestVoteArgs) (*RequestVoteReply, error) {
 	reply := &RequestVoteReply{}
-	err := rc.client.Call("RaftNode.RequestVote", args, reply)
+	err := rc.client.Call("RaftServer.RequestVote", args, reply)
 	return reply, err
 }
 
-func (rc *rpcClient) AppendEntries(args *AppendEntriesArgs) (*AppendEntriesReply, error) {
+func (rc *rpcClient) SendAppendEntries(args *AppendEntriesArgs) (*AppendEntriesReply, error) {
 	reply := &AppendEntriesReply{}
-	err := rc.client.Call("RaftNode.AppendEntries", args, reply)
+	err := rc.client.Call("RaftServer.AppendEntries", args, reply)
 	return reply, err
 }

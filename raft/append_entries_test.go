@@ -9,7 +9,7 @@ func TestAppendEntriesBasic(t *testing.T) {
 	// Create a follower node
 	storage := &MockStorage{}
 	logger := slog.Default()
-	follower := NewRaftNode("follower1", "8080", []string{"leader1"}, storage, logger)
+	follower := NewRaftNode("follower1", "8080", []string{":8081"}, storage, logger)
 	follower.currentTerm = 1
 
 	// Create a simple AppendEntries request (heartbeat)
@@ -45,7 +45,7 @@ func TestAppendEntriesWithEntries(t *testing.T) {
 	// Create a follower node
 	storage := &MockStorage{}
 	logger := slog.Default()
-	follower := NewRaftNode("follower1", "8080", []string{"leader1"}, storage, logger)
+	follower := NewRaftNode("follower1", "8080", []string{":8081"}, storage, logger)
 	follower.currentTerm = 1
 
 	// Create an AppendEntries request with entries
@@ -90,7 +90,7 @@ func TestAppendEntriesLogInconsistency(t *testing.T) {
 	// Create a follower node with existing log
 	storage := &MockStorage{}
 	logger := slog.Default()
-	follower := NewRaftNode("follower1", "8080", []string{"leader1"}, storage, logger)
+	follower := NewRaftNode("follower1", "8080", []string{":8081"}, storage, logger)
 	follower.currentTerm = 2
 	follower.log = []LogEntry{
 		{Term: 1, Index: 0, Command: []byte("command0")},
@@ -106,7 +106,7 @@ func TestAppendEntriesLogInconsistency(t *testing.T) {
 
 	args := &AppendEntriesArgs{
 		Term:         2,
-		LeaderId:     "leader1",
+		LeaderId:     ":8081",
 		PrevLogIndex: 1,
 		PrevLogTerm:  1,
 		Entries:      entries,

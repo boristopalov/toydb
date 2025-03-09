@@ -22,12 +22,14 @@ func (node *raftNode) startElectionTimer() {
 		// Wait for timeout or reset
 		select {
 		case <-time.After(timeout):
+			node.logger.Info("Election timeout elapsed", "node", node.id)
 			node.StartElection()
 		case <-node.resetChan:
 			// Timer was reset, loop and start a new timer
 			continue
 		case <-node.stopChan:
 			// Node is shutting down
+			node.logger.Info("Stopping election timer", "node", node.id)
 			return
 		}
 	}
@@ -65,36 +67,40 @@ func (node *raftNode) StartElection() {
 
 	// Prepare for vote collection
 	term := node.currentTerm
-	// Track votes received (starting with our own vote)
+	// Track votes received
 	var votesReceived atomic.Int32 // thread-safe since this uses atomic hardware instructions
-	votesReceived.Store(1)
+	votesReceived.Store(1)         // vote for ourselves
 
-	neededVotes := (len(node.peers)+1)/2 + 1 // Majority
+	neededVotes := (len(node.peerAddrs)+1)/2 + 1 // Majority
 
 	node.mu.Unlock()
 
 	// Send RequestVote RPCs to all peers
-	for _, peerId := range node.peers {
-		node.logger.Info("Requesting vote from peer", "node", node.id, "peer", peerId)
-		go func(peer string) {
-			reply := &RequestVoteReply{}
-
+	for _, peerAddr := range node.peerAddrs {
+		node.logger.Info("Requesting vote from peer", "node", node.id, "peer", peerAddr)
+		go func(peerAddr string) {
 			// Send RequestVote RPC
-			success := node.SendRequestVote(peer)
-			node.logger.Info("Received vote from peer", "node", node.id, "peer", peer, "success", success)
-			if success {
+			reply := node.SendRequestVote(peerAddr)
+			if reply != nil {
+				node.logger.Info("Received vote from peer", "node", node.id, "peer", peerAddr, "voteGranted", reply.VoteGranted)
 				node.mu.Lock()
 				defer node.mu.Unlock()
 
-				// If we're no longer a candidate or term has changed, ignore reply
-				if node.role != Candidate || node.currentTerm != term {
-					node.logger.Info("Ignoring vote from peer", "node", node.id, "peer", peer, "reason", "not a candidate or term has changed")
+				// If we're no longer a candidate, ignore reply
+				if node.role != Candidate {
+					node.logger.Info("Ignoring vote from peer", "node", node.id, "peer", peerAddr, "reason", "not a candidate", "currentRole", node.role)
+					return
+				}
+
+				// If the term of the vote is different from the current term, ignore the vote
+				if reply.Term != node.currentTerm {
+					node.logger.Info("Ignoring vote from peer", "node", node.id, "peer", peerAddr, "reason", "term mismatch", "currentTerm", node.currentTerm, "voteTerm", reply.Term)
 					return
 				}
 
 				// If we discovered a new term, convert to follower
 				if reply.Term > node.currentTerm {
-					node.logger.Info("Converting to follower due to new term", "node", node.id, "peer", peer, "new term", reply.Term)
+					node.logger.Info("Converting to follower due to new term", "node", node.id, "peer", peerAddr, "new term", reply.Term)
 					node.currentTerm = reply.Term
 					node.role = Follower
 					node.votedFor = ""
@@ -102,28 +108,32 @@ func (node *raftNode) StartElection() {
 					return
 				}
 
-				// If vote was granted
-				newVotes := votesReceived.Add(1)
+				if reply.VoteGranted {
+					node.logger.Info("Vote granted by peer", "node", node.id, "peer", peerAddr)
+					newVotes := votesReceived.Add(1)
 
-				// Check if we have majority and are still a candidate in the same term
-				if newVotes >= int32(neededVotes) && node.role == Candidate && node.currentTerm == term {
-					node.logger.Info("Received majority of votes, becoming leader", "node", node.id)
-					node.BecomeLeader()
+					// Check if we have majority and are still a candidate in the same term
+					if newVotes >= int32(neededVotes) && node.role == Candidate && node.currentTerm == term {
+						node.logger.Info("Received majority of votes, becoming leader", "node", node.id)
+						node.BecomeLeader()
+					}
 				}
 			}
-		}(peerId)
+		}(peerAddr)
 	}
 }
 
 // BecomeLeader transitions a candidate to leader
 func (node *raftNode) BecomeLeader() {
-	// Initialize leader state
-	for _, peerId := range node.peers {
-		node.nextIndex[peerId] = len(node.log) // not sure if this is correct
-		node.matchIndex[peerId] = 0
-	}
-
 	node.role = Leader
+
+	// Initialize leader state
+	for _, peerAddr := range node.peerAddrs {
+		// when a leader is elected, it sets the nextIndex for all peers to the length of the log
+		// ensures that sending AppendEntries to all peers will not fail due to mismatch in log index
+		node.nextIndex[peerAddr] = len(node.log)
+		node.matchIndex[peerAddr] = 0
+	}
 
 	// Start sending heartbeats immediately and then periodically
 	node.SendHeartbeats()

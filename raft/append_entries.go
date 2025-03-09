@@ -7,7 +7,7 @@ import (
 
 type AppendEntriesSender interface {
 	AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) error
-	SendAppendEntries(peerId string) bool
+	SendAppendEntries(peerId string) *AppendEntriesReply
 }
 
 // AppendEntriesArgs contains the arguments for the AppendEntries RPC
@@ -59,6 +59,7 @@ func (node *raftNode) AppendEntries(args *AppendEntriesArgs, reply *AppendEntrie
 		// Check if our log is long enough
 		if args.PrevLogIndex >= len(node.log) {
 			// Log is too short
+			node.logger.Info("Log is too short", "prevLogIndex", args.PrevLogIndex, "logLength", len(node.log))
 			reply.NextIndex = len(node.log)
 			return errors.New("log is too short")
 		}
@@ -120,18 +121,17 @@ func (node *raftNode) AppendEntries(args *AppendEntriesArgs, reply *AppendEntrie
 }
 
 // SendAppendEntries is called by the leader to send AppendEntries RPCs to followers
-func (node *raftNode) SendAppendEntries(peerId string) bool {
-	node.logger.Info("Sending AppendEntries to peer", "node", node.id, "peer", peerId)
+func (node *raftNode) SendAppendEntries(peerId string) *AppendEntriesReply {
 	node.mu.Lock()
 
 	// Only leaders can send AppendEntries
 	if node.role != Leader {
 		node.mu.Unlock()
-		return false
+		return nil
 	}
 
 	// Prepare arguments
-	prevLogIndex := node.nextIndex[peerId] - 1
+	prevLogIndex := max(0, node.nextIndex[peerId]-1)
 	prevLogTerm := 0
 	if prevLogIndex > 0 && prevLogIndex < len(node.log) {
 		prevLogTerm = node.log[prevLogIndex].Term
@@ -154,67 +154,72 @@ func (node *raftNode) SendAppendEntries(peerId string) bool {
 
 	node.mu.Unlock()
 
-	// Send RPC (in a real implementation, this would use network communication)
-	reply := &AppendEntriesReply{}
-
-	// Simulate RPC call (in a real implementation, this would be a network call)
-	// For now, we'll just return true to indicate success
-	success := true
-
-	// Process reply
-	if success {
-		node.mu.Lock()
-		defer node.mu.Unlock()
-
-		// If we're no longer the leader or term has changed, ignore reply
-		if node.role != Leader || node.currentTerm != args.Term {
-			return false
-		}
-
-		// If AppendEntries was successful
-		if reply.Success {
-			// Update nextIndex and matchIndex for this follower
-			node.matchIndex[peerId] = prevLogIndex + len(entries)
-			node.nextIndex[peerId] = node.matchIndex[peerId] + 1
-
-			// Check if we can advance commitIndex
-			// Find the highest index that is replicated on a majority of servers
-			for n := len(node.log) - 1; n > node.commitIndex; n-- {
-				// Only commit entries from current term
-				if node.log[n].Term != node.currentTerm {
-					continue
-				}
-
-				// Count replications
-				count := 1 // Leader has the entry
-				for _, peerID := range node.peers {
-					if node.matchIndex[peerID] >= n {
-						count++
-					}
-				}
-
-				// If we have a majority
-				if count*2 > len(node.peers)+1 {
-					node.commitIndex = n
-					// Apply committed entries to state machine (would be implemented elsewhere)
-					break
-				}
-			}
-
-			return true
-		} else {
-			// AppendEntries failed because of log inconsistency
-			// Decrement nextIndex and retry
-			if reply.NextIndex > 0 {
-				// Use the hint if provided
-				node.nextIndex[peerId] = reply.NextIndex
-			} else {
-				// Otherwise just decrement
-				node.nextIndex[peerId] = prevLogIndex
-			}
-			return false
-		}
+	peer, ok := node.peerClients[peerId]
+	if !ok {
+		node.logger.Error("AppendEntries failed", "node", node.id, "peer", peerId, "error", "peer not found")
+		return nil
 	}
 
-	return false
+	node.logger.Info("Sending AppendEntries to peer", "node", node.id, "peer", peerId, "nextIndex", node.nextIndex[peerId], "logLength", len(node.log))
+	reply, err := peer.SendAppendEntries(args)
+	if err != nil {
+		node.logger.Error("AppendEntries failed", "node", node.id, "peer", peerId, "error", err)
+		return nil
+	}
+
+	// Process reply
+	node.mu.Lock()
+	defer node.mu.Unlock()
+
+	// If we're no longer the leader or term has changed, ignore reply
+	if node.role != Leader || node.currentTerm != args.Term {
+		node.logger.Info("AppendEntries failed", "node", node.id, "peer", peerId, "reason", "not leader or term has changed")
+		return nil
+	}
+
+	// If AppendEntries was successful
+	if reply.Success {
+		node.logger.Info("AppendEntries successful", "node", node.id, "peer", peerId, "numEntries", len(entries), "nextIndex", node.nextIndex[peerId], "logLength", len(node.log))
+		// Update nextIndex and matchIndex for this follower
+		node.matchIndex[peerId] = prevLogIndex + len(entries)
+		node.nextIndex[peerId] = node.matchIndex[peerId] + len(entries)
+
+		// Check if we can advance commitIndex
+		// Find the highest index that is replicated on a majority of servers
+		for n := max(0, len(node.log)-1); n > node.commitIndex; n-- {
+			// Only commit entries from current term
+			if node.log[n].Term != node.currentTerm {
+				continue
+			}
+
+			// Count replications
+			count := 1 // Leader has the entry
+			for _, peerAddr := range node.peerAddrs {
+				if node.matchIndex[peerAddr] >= n {
+					count++
+				}
+			}
+
+			// If we have a majority
+			if count*2 > len(node.peerAddrs)+1 {
+				node.commitIndex = n
+				// Apply committed entries to state machine (would be implemented elsewhere)
+				break
+			}
+		}
+
+		return reply
+	} else {
+		// AppendEntries failed because of log inconsistency
+		// Decrement nextIndex and retry
+		if reply.NextIndex > 0 {
+			// Use the hint if provided
+			node.nextIndex[peerId] = reply.NextIndex
+		} else {
+			// Otherwise just decrement
+			node.nextIndex[peerId] = prevLogIndex
+		}
+		return reply
+	}
+
 }

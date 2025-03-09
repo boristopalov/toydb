@@ -9,7 +9,7 @@ func TestRequestVoteBasic(t *testing.T) {
 	// Create a follower node
 	storage := &MockStorage{}
 	logger := slog.Default()
-	peers := []string{"candidate1", "candidate2"}
+	peers := []string{":8081", ":8082"}
 	follower := NewRaftNode("follower1", "8080", peers, storage, logger)
 	follower.currentTerm = 1
 
@@ -48,7 +48,7 @@ func TestRequestVoteAlreadyVoted(t *testing.T) {
 	// Create a follower node that already voted
 	storage := &MockStorage{}
 	logger := slog.Default()
-	peers := []string{"candidate1", "candidate2"}
+	peers := []string{":8081", ":8082"}
 	follower := NewRaftNode("follower1", "8080", peers, storage, logger)
 	follower.currentTerm = 2
 	follower.votedFor = "candidate1"
@@ -84,7 +84,7 @@ func TestRequestVoteLogUpToDate(t *testing.T) {
 	// Create a follower node with some log entries
 	storage := &MockStorage{}
 	logger := slog.Default()
-	peers := []string{"candidate1", "candidate2"}
+	peers := []string{":8081", ":8082"}
 	follower := NewRaftNode("follower1", "8080", peers, storage, logger)
 	follower.currentTerm = 2
 	follower.log = []LogEntry{

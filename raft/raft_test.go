@@ -37,8 +37,8 @@ func (ms *MockStorage) GetLogEntries(startIndex, endIndex int) ([]LogEntry, erro
 func TestNewRaftNode(t *testing.T) {
 	storage := &MockStorage{}
 	logger := slog.Default()
-	peers := []string{"node1", "node2"}
-	node := NewRaftNode("node1", "8080", peers, storage, logger)
+	peerAddrs := []string{":8081", ":8082"}
+	node := NewRaftNode("node1", "8080", peerAddrs, storage, logger)
 
 	if node.id != "node1" {
 		t.Errorf("Expected node ID to be 'node1', got '%s'", node.id)
@@ -48,7 +48,7 @@ func TestNewRaftNode(t *testing.T) {
 		t.Errorf("New nodes should start as followers")
 	}
 
-	if len(node.peers) != 2 {
-		t.Errorf("Expected 2 peers, got %d", len(node.peers))
+	if len(node.peerAddrs) != 2 {
+		t.Errorf("Expected 2 peers, got %d", len(node.peerAddrs))
 	}
 }
