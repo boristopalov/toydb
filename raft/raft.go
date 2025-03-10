@@ -54,6 +54,14 @@ type raftNode struct {
 	commitIndex int // Index of the highest committed log entry
 	lastApplied int // Index of the highest log entry in the state machine
 
+	// Channel to notify external clients of committed entries
+	newCommitChan       chan struct{}
+	committedValuesChan chan LogEntry
+
+	// Client subscriptions
+	clientChannels map[string]chan LogEntry
+	clientMu       sync.RWMutex
+
 	// Leader state -- only used if role is Leader
 	nextIndex  map[string]int // Next index to send to each follower
 	matchIndex map[string]int // Highest index known to be replicated (not just sent), i.e. follower has accepted the entry to the leader
@@ -80,23 +88,27 @@ type raftNode struct {
 // NewRaftNode creates a new Raft node
 func NewRaftNode(id string, port string, peerAddrs []string, storage Storage, logger *slog.Logger) *raftNode {
 	node := &raftNode{
-		id:          id,
-		peerAddrs:   peerAddrs,
-		storage:     storage,
-		role:        Follower,
-		currentTerm: 0,
-		votedFor:    "",
-		log:         make([]LogEntry, 0),
-		commitIndex: 0,
-		lastApplied: 0,
-		nextIndex:   make(map[string]int),
-		matchIndex:  make(map[string]int),
-		resetChan:   make(chan struct{}, 1), // Buffer of 1 to avoid blocking
-		stopChan:    make(chan struct{}),
-		peerClients: make(map[string]RaftClient),
-		running:     false,
-		port:        port,
-		logger:      logger,
+		id:                  id,
+		peerAddrs:           peerAddrs,
+		storage:             storage,
+		role:                Follower,
+		currentTerm:         0,
+		votedFor:            "",
+		log:                 make([]LogEntry, 0),
+		commitIndex:         -1,
+		lastApplied:         -1,
+		nextIndex:           make(map[string]int),
+		matchIndex:          make(map[string]int),
+		resetChan:           make(chan struct{}, 1), // Buffer of 1 to avoid blocking
+		stopChan:            make(chan struct{}),
+		peerClients:         make(map[string]RaftClient),
+		newCommitChan:       make(chan struct{}, 1), // Buffer of 1 to avoid blocking
+		committedValuesChan: make(chan LogEntry),
+		clientChannels:      make(map[string]chan LogEntry),
+		clientMu:            sync.RWMutex{},
+		running:             false,
+		port:                port,
+		logger:              logger,
 	}
 
 	return node
@@ -116,6 +128,9 @@ func (node *raftNode) Start() {
 	}
 
 	go node.rpcServer.Start()
+
+	go node.listenForNewCommits()
+	go node.broadcastCommittedEntries()
 	node.running = true
 }
 
@@ -168,4 +183,83 @@ func (node *raftNode) Stop() {
 
 func (node *raftNode) GetId() string {
 	return node.id
+}
+
+func (node *raftNode) SubmitCommand(command []byte) {
+	node.mu.Lock()
+	defer node.mu.Unlock()
+
+	if node.role != Leader {
+		node.logger.Error("SubmitCommand failed", "node", node.id, "error", "not a leader")
+		return
+	}
+
+	node.logger.Info("Submitting command", "node", node.id, "command", command)
+	node.log = append(node.log, LogEntry{Term: node.currentTerm, Command: command})
+}
+
+// Subscribe registers a client and returns a channel for committed entries
+func (node *raftNode) Subscribe(clientID string) <-chan LogEntry {
+	clientChan := make(chan LogEntry, 100)
+
+	node.clientMu.Lock()
+	node.clientChannels[clientID] = clientChan
+	node.clientMu.Unlock()
+
+	return clientChan
+}
+
+// Unsubscribe removes a client subscription
+func (node *raftNode) Unsubscribe(clientID string) {
+	node.clientMu.Lock()
+	defer node.clientMu.Unlock()
+
+	if ch, ok := node.clientChannels[clientID]; ok {
+		close(ch)
+		delete(node.clientChannels, clientID)
+	}
+}
+
+func (node *raftNode) broadcastCommittedEntries() {
+	for entry := range node.committedValuesChan {
+		node.clientMu.RLock()
+		for clientID, clientChan := range node.clientChannels {
+			select {
+			case clientChan <- entry:
+				// Entry sent successfully
+			default:
+				node.logger.Warn("Client channel full, dropping entry", "clientID", clientID)
+				// Could implement a policy to disconnect slow clients
+			}
+		}
+		node.clientMu.RUnlock()
+	}
+}
+
+func (node *raftNode) listenForNewCommits() {
+	for range node.newCommitChan {
+		node.logger.Info("[Leader] New commits detected", "node", node.id, "commitIndex", node.commitIndex)
+		node.mu.Lock()
+		currentTerm := node.currentTerm
+
+		// lastApplied is the index of the last log entry that was applied to the state machine
+		// Before this batch of commits
+		lastApplied := node.lastApplied
+		var entriesToApply []LogEntry
+		if node.commitIndex > node.lastApplied {
+			entriesToApply = node.log[node.lastApplied+1 : node.commitIndex+1]
+			node.lastApplied = node.commitIndex
+		}
+		node.mu.Unlock()
+
+		// Send committed entries to commmit channel
+		for i, entry := range entriesToApply {
+			node.committedValuesChan <- LogEntry{
+				Term:    currentTerm,
+				Index:   lastApplied + i + 1,
+				Command: entry.Command,
+			}
+		}
+	}
+	node.logger.Info("listenForNewCommits finished", "node", node.id)
 }

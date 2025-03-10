@@ -92,12 +92,6 @@ func (node *raftNode) StartElection() {
 					return
 				}
 
-				// If the term of the vote is different from the current term, ignore the vote
-				if reply.Term != node.currentTerm {
-					node.logger.Info("Ignoring vote from peer", "node", node.id, "peer", peerAddr, "reason", "term mismatch", "currentTerm", node.currentTerm, "voteTerm", reply.Term)
-					return
-				}
-
 				// If we discovered a new term, convert to follower
 				if reply.Term > node.currentTerm {
 					node.logger.Info("Converting to follower due to new term", "node", node.id, "peer", peerAddr, "new term", reply.Term)
@@ -105,6 +99,12 @@ func (node *raftNode) StartElection() {
 					node.role = Follower
 					node.votedFor = ""
 					node.storage.SaveState(node.currentTerm, node.votedFor)
+					return
+				}
+
+				// If the term of the vote is different from the current term, ignore the vote
+				if reply.Term != node.currentTerm {
+					node.logger.Info("Ignoring vote from peer", "node", node.id, "peer", peerAddr, "reason", "term mismatch", "currentTerm", node.currentTerm, "voteTerm", reply.Term)
 					return
 				}
 
@@ -129,8 +129,9 @@ func (node *raftNode) BecomeLeader() {
 
 	// Initialize leader state
 	for _, peerAddr := range node.peerAddrs {
-		// when a leader is elected, it sets the nextIndex for all peers to the length of the log
-		// ensures that sending AppendEntries to all peers will not fail due to mismatch in log index
+		// When a leader is elected, it sets the nextIndex for all peers to the length of the log.
+		// This ensures that sending AppendEntries to all peers will not fail due to mismatch in log index.
+		// This limits the number of entries that can be sent to a peer to the number of entries in the new leader's log
 		node.nextIndex[peerAddr] = len(node.log)
 		node.matchIndex[peerAddr] = 0
 	}

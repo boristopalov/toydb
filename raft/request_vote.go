@@ -75,12 +75,13 @@ func (node *raftNode) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply
 	}
 
 	reply.VoteGranted = voteGranted
-	node.logger.Info("RequestVote reply", "node", node.id, "reply", reply)
 
 	if reply.VoteGranted {
 		node.logger.Info("Vote granted to candidate", "node", node.id, "candidate", args.CandidateId)
 		// Reset election timeout since we granted a vote
 		node.resetElectionTimeout()
+	} else {
+		node.logger.Info("Vote not granted to candidate", "node", node.id, "candidate", args.CandidateId)
 	}
 
 	return nil

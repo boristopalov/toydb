@@ -3,6 +3,9 @@ package raft
 import (
 	"log/slog"
 	"testing"
+	"time"
+
+	"github.com/google/uuid"
 )
 
 func TestAppendEntriesBasic(t *testing.T) {
@@ -45,44 +48,67 @@ func TestAppendEntriesWithEntries(t *testing.T) {
 	// Create a follower node
 	storage := &MockStorage{}
 	logger := slog.Default()
-	follower := NewRaftNode("follower1", "8080", []string{":8081"}, storage, logger)
-	follower.currentTerm = 1
+	node1 := NewRaftNode("node1", "8080", []string{":8081"}, storage, logger)
+	node2 := NewRaftNode("node2", "8081", []string{":8080"}, storage, logger)
 
-	// Create an AppendEntries request with entries
-	entries := []LogEntry{
-		{Term: 1, Index: 1, Command: []byte("command1")},
-		{Term: 1, Index: 2, Command: []byte("command2")},
-	}
+	node1.Start()
+	node2.Start()
+	defer node1.Stop()
+	defer node2.Stop()
 
-	args := &AppendEntriesArgs{
-		Term:         1,
-		LeaderId:     "leader1",
-		PrevLogIndex: 0,
-		PrevLogTerm:  0,
-		Entries:      entries,
-		LeaderCommit: 2,
-	}
+	node1.ConnectToPeers()
+	node2.ConnectToPeers()
 
-	reply := &AppendEntriesReply{}
+	// Subscribe to leader's committed entries
+	clientID := uuid.New().String()
+	clientChan := node1.Subscribe(clientID)
+	defer node1.Unsubscribe(clientID)
 
-	// Process the request
-	err := follower.AppendEntries(args, reply)
+	// Start election on node1
+	node1.StartElection()
+
+	// Wait for election to complete
+	time.Sleep(200 * time.Millisecond)
+
+	// Submit a command to the leader
+	cmd1 := []byte("command1")
+	cmd2 := []byte("command2")
+	node1.SubmitCommand(cmd1)
+	node1.SubmitCommand(cmd2)
+
+	// // Wait for the command to be committed
+	time.Sleep(300 * time.Millisecond)
 
 	// Verify results
-	if !reply.Success {
-		t.Errorf("AppendEntries returned error: %v", err)
+	if len(node1.log) != 2 {
+		t.Errorf("Expected 2 log entries on leader, got %d", len(node1.log))
 	}
 
-	if !reply.Success {
-		t.Errorf("AppendEntries should succeed for valid entries")
+	if len(node2.log) != 2 {
+		t.Errorf("Expected 2 log entries on follower, got %d", len(node2.log))
 	}
 
-	if len(follower.log) != 2 {
-		t.Errorf("Expected 2 log entries, got %d", len(follower.log))
+	// our log is zero-indexed so the second entry is index 1
+	if node1.commitIndex != 1 {
+		t.Errorf("Expected commitIndex to be 1, got %d", node1.commitIndex)
 	}
 
-	if follower.commitIndex != 2 {
-		t.Errorf("Expected commitIndex to be 2, got %d", follower.commitIndex)
+	select {
+	case entry := <-clientChan:
+		if string(entry.Command) != string(cmd1) {
+			t.Errorf("Expected command %s, got %s", cmd1, entry.Command)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Errorf("Expected entry 1 to be received, got nothing")
+	}
+
+	select {
+	case entry := <-clientChan:
+		if string(entry.Command) != string(cmd2) {
+			t.Errorf("Expected command %s, got %s", cmd2, entry.Command)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Errorf("Expected entry 2 to be received, got nothing")
 	}
 }
 

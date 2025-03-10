@@ -17,6 +17,8 @@ func (node *raftNode) SendHeartbeats() {
 }
 
 // StartHeartbeatTimer starts a timer to send heartbeats periodically
+// TODO: add a channel to send heartbeats immediately after a command is received
+// OR after 50ms if no command is received
 func (node *raftNode) StartHeartbeatTimer() {
 	heartbeatInterval := 50 * time.Millisecond // Typically shorter than election timeout
 

@@ -110,12 +110,10 @@ func (s *RaftRPCServer) Stop() {
 
 // RequestVote handles the RequestVote RPC
 func (r *RaftRPC) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) error {
-	r.logger.Info("Received RequestVote RPC SERVER", "from", args.CandidateId, "term", args.Term)
 	return r.node.RequestVote(args, reply)
 }
 
 // AppendEntries handles the AppendEntries RPC
 func (r *RaftRPC) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) error {
-	r.logger.Info("Received AppendEntries RPC SERVER", "from", args.LeaderId, "term", args.Term)
 	return r.node.AppendEntries(args, reply)
 }

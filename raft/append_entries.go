@@ -53,6 +53,13 @@ func (node *raftNode) AppendEntries(args *AppendEntriesArgs, reply *AppendEntrie
 	// Reset election timeout since we received a valid AppendEntries from the leader
 	node.resetElectionTimeout()
 
+	if len(args.Entries) == 0 {
+		node.logger.Info("[Follower] Received heartbeat from leader", "node", node.id, "leader", args.LeaderId)
+		reply.Success = true
+		reply.NextIndex = args.PrevLogIndex
+		return nil
+	}
+
 	// 2. Reply false if log doesn't contain an entry at prevLogIndex
 	// whose term matches prevLogTerm (§5.3)
 	if args.PrevLogIndex > 0 {
@@ -81,8 +88,8 @@ func (node *raftNode) AppendEntries(args *AppendEntriesArgs, reply *AppendEntrie
 	}
 
 	// 3. If an existing entry conflicts with a new one (same index but different terms),
-	// delete the existing entry and all that follow it (§5.3)
-	// 4. Append any new entries not already in the log
+	// delete the existing entry and all that follow it (§5.3).
+	// Append any new entries not already in the log
 	newEntries := make([]LogEntry, 0)
 	for i, entry := range args.Entries {
 		logIndex := args.PrevLogIndex + 1 + i
@@ -107,13 +114,13 @@ func (node *raftNode) AppendEntries(args *AppendEntriesArgs, reply *AppendEntrie
 		node.storage.AppendLogEntries(newEntries)
 	}
 
-	// 5. If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
+	// 4. If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
+	// this happens when the leader has committed new entries
 	if args.LeaderCommit > node.commitIndex {
 		lastNewIndex := args.PrevLogIndex + len(args.Entries)
 		node.commitIndex = min(args.LeaderCommit, lastNewIndex)
-
-		// Apply committed entries to state machine (would be implemented elsewhere)
-		// This would trigger applying entries between lastApplied and commitIndex
+		node.logger.Info("[Follower] CommitIndex updated", "node", node.id, "commitIndex", node.commitIndex)
+		node.newCommitChan <- struct{}{}
 	}
 
 	reply.Success = true
@@ -124,6 +131,8 @@ func (node *raftNode) AppendEntries(args *AppendEntriesArgs, reply *AppendEntrie
 func (node *raftNode) SendAppendEntries(peerId string) *AppendEntriesReply {
 	node.mu.Lock()
 
+	currentTerm := node.currentTerm
+
 	// Only leaders can send AppendEntries
 	if node.role != Leader {
 		node.mu.Unlock()
@@ -131,14 +140,18 @@ func (node *raftNode) SendAppendEntries(peerId string) *AppendEntriesReply {
 	}
 
 	// Prepare arguments
-	prevLogIndex := max(0, node.nextIndex[peerId]-1)
+	prevLogIndex := node.nextIndex[peerId] - 1
 	prevLogTerm := 0
+
+	// if prevLogIndex is l.t. log length, get the term of the last log entry
 	if prevLogIndex > 0 && prevLogIndex < len(node.log) {
 		prevLogTerm = node.log[prevLogIndex].Term
 	}
 
 	// Get entries to send
 	entries := make([]LogEntry, 0)
+
+	// if nextIndex is l.t. log length, get the entries from nextIndex to the end of the log
 	if node.nextIndex[peerId] < len(node.log) {
 		entries = node.log[node.nextIndex[peerId]:]
 	}
@@ -152,18 +165,17 @@ func (node *raftNode) SendAppendEntries(peerId string) *AppendEntriesReply {
 		LeaderCommit: node.commitIndex,
 	}
 
-	node.mu.Unlock()
-
 	peer, ok := node.peerClients[peerId]
 	if !ok {
 		node.logger.Error("AppendEntries failed", "node", node.id, "peer", peerId, "error", "peer not found")
 		return nil
 	}
 
-	node.logger.Info("Sending AppendEntries to peer", "node", node.id, "peer", peerId, "nextIndex", node.nextIndex[peerId], "logLength", len(node.log))
+	node.logger.Info("[Leader] Sending AppendEntries to peer", "node", node.id, "peer", peerId, "args", args)
+	node.mu.Unlock()
 	reply, err := peer.SendAppendEntries(args)
 	if err != nil {
-		node.logger.Error("AppendEntries failed", "node", node.id, "peer", peerId, "error", err)
+		node.logger.Error("[Leader] AppendEntries failed", "node", node.id, "peer", peerId, "error", err)
 		return nil
 	}
 
@@ -172,29 +184,43 @@ func (node *raftNode) SendAppendEntries(peerId string) *AppendEntriesReply {
 	defer node.mu.Unlock()
 
 	// If we're no longer the leader or term has changed, ignore reply
-	if node.role != Leader || node.currentTerm != args.Term {
-		node.logger.Info("AppendEntries failed", "node", node.id, "peer", peerId, "reason", "not leader or term has changed")
+	if node.role != Leader {
+		node.logger.Info("[Leader] AppendEntries failed", "node", node.id, "peer", peerId, "reason", "not leader")
 		return nil
+	}
+
+	if reply.Term > currentTerm {
+		node.logger.Info("[Leader] AppendEntries failed", "node", node.id, "peer", peerId, "reason", "term has changed")
+		node.currentTerm = reply.Term
+		node.role = Follower
+		node.votedFor = ""
+		node.storage.SaveState(node.currentTerm, node.votedFor)
 	}
 
 	// If AppendEntries was successful
 	if reply.Success {
-		node.logger.Info("AppendEntries successful", "node", node.id, "peer", peerId, "numEntries", len(entries), "nextIndex", node.nextIndex[peerId], "logLength", len(node.log))
+		node.logger.Info("[Leader] AppendEntries successful", "node", node.id, "peer", peerId, "numEntries", len(entries), "nextIndex", node.nextIndex[peerId], "logLength", len(node.log))
 		// Update nextIndex and matchIndex for this follower
 		node.matchIndex[peerId] = prevLogIndex + len(entries)
-		node.nextIndex[peerId] = node.matchIndex[peerId] + len(entries)
+		if node.matchIndex[peerId] > 0 {
+			node.nextIndex[peerId] = node.matchIndex[peerId] + 1
+		}
+		node.logger.Info("[Leader] Updated peer's nextIndex and matchIndex", "node", node.id, "peer", peerId, "nextIndex", node.nextIndex[peerId], "matchIndex", node.matchIndex[peerId])
+
+		prevCommitIndex := node.commitIndex
 
 		// Check if we can advance commitIndex
 		// Find the highest index that is replicated on a majority of servers
 		for n := max(0, len(node.log)-1); n > node.commitIndex; n-- {
-			// Only commit entries from current term
-			if node.log[n].Term != node.currentTerm {
+			// Only look at entries from current term
+			if n == 0 || node.log[n].Term != node.currentTerm {
 				continue
 			}
 
 			// Count replications
 			count := 1 // Leader has the entry
 			for _, peerAddr := range node.peerAddrs {
+				// Only count peers that have a matchIndex greater than or equal to n
 				if node.matchIndex[peerAddr] >= n {
 					count++
 				}
@@ -203,9 +229,14 @@ func (node *raftNode) SendAppendEntries(peerId string) *AppendEntriesReply {
 			// If we have a majority
 			if count*2 > len(node.peerAddrs)+1 {
 				node.commitIndex = n
-				// Apply committed entries to state machine (would be implemented elsewhere)
+				node.logger.Info("[Leader] CommitIndex updated", "node", node.id, "commitIndex", node.commitIndex)
 				break
 			}
+		}
+
+		// Used to notify external clients of newly committed entries
+		if node.commitIndex > prevCommitIndex {
+			node.newCommitChan <- struct{}{}
 		}
 
 		return reply
@@ -221,5 +252,4 @@ func (node *raftNode) SendAppendEntries(peerId string) *AppendEntriesReply {
 		}
 		return reply
 	}
-
 }

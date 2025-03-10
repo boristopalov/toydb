@@ -68,17 +68,19 @@ func TestElectionBasic(t *testing.T) {
 	node2.ConnectToPeers()
 	node3.ConnectToPeers()
 
+	// Clean up
+	defer node1.Stop()
+	defer node2.Stop()
+	defer node3.Stop()
+
 	// Manually trigger an election on node1
 	node1.StartElection()
-
-	// Check if node1 became the leader
 
 	time.Sleep(300 * time.Millisecond)
 
 	node1.mu.Lock()
 	role1 := node1.role
 	term1 := node1.currentTerm
-
 	node1.mu.Unlock()
 
 	if role1 != Leader {
@@ -108,10 +110,6 @@ func TestElectionBasic(t *testing.T) {
 		t.Errorf("Expected all nodes to vote for node1, but got votedFor2=%s, votedFor3=%s", votedFor2, votedFor3)
 	}
 
-	// Clean up
-	node1.Stop()
-	node2.Stop()
-	node3.Stop()
 }
 
 // TestElectionWithDisconnection tests election behavior when nodes disconnect
@@ -142,6 +140,10 @@ func TestElectionWithDisconnection(t *testing.T) {
 	node1.ConnectToPeers()
 	node2.ConnectToPeers()
 	node3.ConnectToPeers()
+
+	defer node1.Stop()
+	defer node2.Stop()
+	defer node3.Stop()
 
 	// Manually trigger an election on node1
 	node1.StartElection()
@@ -195,7 +197,4 @@ func TestElectionWithDisconnection(t *testing.T) {
 		t.Errorf("Expected term to be 2 after new election, but got term3=%d", term3)
 	}
 
-	// Clean up
-	node2.Stop()
-	node3.Stop()
 }
