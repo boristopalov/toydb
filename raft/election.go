@@ -127,6 +127,8 @@ func (node *raftNode) StartElection() {
 func (node *raftNode) BecomeLeader() {
 	node.role = Leader
 
+	node.storage.SaveState(node.currentTerm, node.votedFor)
+
 	// Initialize leader state
 	for _, peerAddr := range node.peerAddrs {
 		// When a leader is elected, it sets the nextIndex for all peers to the length of the log.

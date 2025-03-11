@@ -1,8 +1,7 @@
 package raft
 
 import (
-	"bufio"
-	"encoding/json"
+	"encoding/gob"
 	"fmt"
 	"os"
 	"sync"
@@ -99,12 +98,9 @@ func (s *simpleDiskStorage) AppendLogEntries(entries []LogEntry) error {
 	}
 	defer file.Close()
 
+	encoder := gob.NewEncoder(file)
 	for _, entry := range entries {
-		data, err := json.Marshal(entry)
-		if err != nil {
-			return err
-		}
-		if _, err := file.Write(append(data, '\n')); err != nil {
+		if err := encoder.Encode(entry); err != nil {
 			return err
 		}
 	}
@@ -124,11 +120,11 @@ func (s *simpleDiskStorage) GetLogEntries(startIndex, endIndex int) ([]LogEntry,
 		}
 		defer file.Close()
 
-		scanner := bufio.NewScanner(file)
-		for scanner.Scan() {
+		decoder := gob.NewDecoder(file)
+		for {
 			var entry LogEntry
-			if err := json.Unmarshal(scanner.Bytes(), &entry); err != nil {
-				return nil, err
+			if err := decoder.Decode(&entry); err != nil {
+				break // End of file or error
 			}
 			s.log = append(s.log, entry)
 		}
