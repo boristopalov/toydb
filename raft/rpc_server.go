@@ -75,11 +75,27 @@ func (s *RaftRPCServer) Start() (string, error) {
 
 	// Handle connections in a goroutine
 	go func() {
-		for s.running {
+		for {
+			// Check if we should stop accepting connections
+			s.mu.Lock()
+			if !s.running {
+				s.mu.Unlock()
+				break
+			}
+			s.mu.Unlock()
+
 			conn, err := s.listener.Accept()
 			if err != nil {
-				if s.running {
+				s.mu.Lock()
+				isRunning := s.running
+				s.mu.Unlock()
+
+				if isRunning {
 					s.logger.Error("Error accepting connection", "error", err)
+				}
+				// If we're not running, this error is expected (from closing the listener)
+				if !isRunning {
+					break
 				}
 				continue
 			}

@@ -111,6 +111,20 @@ func NewRaftNode(id string, port string, peerAddrs []string, storage Storage, lo
 		logger:              logger,
 	}
 
+	term, votedFor, err := node.storage.LoadState()
+	if err != nil {
+		node.logger.Error("Failed to load state", "error", err)
+	}
+	node.currentTerm = term
+	node.votedFor = votedFor
+
+	// Load log entries from disk
+	logEntries, err := node.storage.GetLogEntries(0, -1)
+	if err != nil {
+		node.logger.Error("Failed to load log entries", "error", err)
+	}
+	node.log = logEntries
+
 	return node
 }
 
