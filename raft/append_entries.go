@@ -235,8 +235,10 @@ func (node *raftNode) SendAppendEntries(peerId string) *AppendEntriesReply {
 		}
 
 		// Used to notify external clients of newly committed entries
+		// and to immediately send AppendEntries to the follower with the newly committed entries
 		if node.commitIndex > prevCommitIndex {
 			node.newCommitChan <- struct{}{}
+			node.commandChan <- struct{}{}
 		}
 
 		return reply

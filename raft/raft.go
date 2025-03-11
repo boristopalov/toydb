@@ -79,6 +79,9 @@ type raftNode struct {
 	resetChan chan struct{} // Signal to reset election timer
 	stopChan  chan struct{} // Signal to stop election timer
 
+	// Command channel to tell the leader to send AppendEntries
+	commandChan chan struct{}
+
 	// Running state
 	running bool
 
@@ -101,6 +104,7 @@ func NewRaftNode(id string, port string, peerAddrs []string, storage Storage, lo
 		matchIndex:          make(map[string]int),
 		resetChan:           make(chan struct{}, 1), // Buffer of 1 to avoid blocking
 		stopChan:            make(chan struct{}),
+		commandChan:         make(chan struct{}, 1), // Buffer of 1 to avoid blocking
 		peerClients:         make(map[string]RaftClient),
 		newCommitChan:       make(chan struct{}, 1), // Buffer of 1 to avoid blocking
 		committedValuesChan: make(chan LogEntry),
@@ -202,15 +206,67 @@ func (node *raftNode) GetId() string {
 
 func (node *raftNode) SubmitCommand(command []byte) {
 	node.mu.Lock()
-	defer node.mu.Unlock()
 
 	if node.role != Leader {
 		node.logger.Error("SubmitCommand failed", "node", node.id, "error", "not a leader")
+		node.mu.Unlock()
 		return
 	}
 
 	node.logger.Info("Submitting command", "node", node.id, "command", command)
-	node.log = append(node.log, LogEntry{Term: node.currentTerm, Command: command})
+	newEntry := LogEntry{Term: node.currentTerm, Command: command}
+	node.log = append(node.log, newEntry)
+	node.mu.Unlock()
+
+	select {
+	case node.commandChan <- struct{}{}:
+		// Successfully sent command notification
+	default:
+		// Channel is full, log a warning but don't block
+		node.logger.Warn("Command channel full, AppendEntries might be delayed", "node", node.id)
+	}
+	node.storage.AppendLogEntries([]LogEntry{newEntry})
+}
+
+func (node *raftNode) SubmitCommandBatch(commands [][]byte) {
+	if len(commands) == 0 {
+		return // Nothing to do
+	}
+
+	node.mu.Lock()
+
+	if node.role != Leader {
+		node.logger.Error("SubmitCommandBatch failed", "node", node.id, "error", "not a leader", "commandCount", len(commands))
+		node.mu.Unlock()
+		return
+	}
+
+	node.logger.Info("Submitting command batch", "node", node.id, "commandCount", len(commands))
+
+	// Create log entries for all commands
+	newEntries := make([]LogEntry, len(commands))
+	for i, cmd := range commands {
+		newEntries[i] = LogEntry{
+			Term:    node.currentTerm,
+			Command: cmd,
+		}
+	}
+
+	// Append all entries to the log
+	node.log = append(node.log, newEntries...)
+	node.mu.Unlock()
+
+	// Notify about new commands (only once for the whole batch)
+	select {
+	case node.commandChan <- struct{}{}:
+		// Successfully sent command notification
+	default:
+		// Channel is full, log a warning but don't block
+		node.logger.Warn("Command channel full, AppendEntries might be delayed", "node", node.id, "commandCount", len(commands))
+	}
+
+	// Persist all entries at once
+	node.storage.AppendLogEntries(newEntries)
 }
 
 // Subscribe registers a client and returns a channel for committed entries

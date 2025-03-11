@@ -142,7 +142,7 @@ func (node *raftNode) BecomeLeader() {
 	node.SendHeartbeats()
 
 	// Start heartbeat timer
-	go node.StartHeartbeatTimer()
+	go node.StartAppendEntriesTimer()
 }
 
 // Helper function to generate random election timeout
