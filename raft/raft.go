@@ -13,11 +13,13 @@ import (
 
 // RaftNodeInterface combines all the interfaces that a RaftNode should implement
 type RaftNode interface {
-	RequestVoter
-	AppendEntriesSender
-	ElectionHandler
+	StartElection()
 	Start()
 	Stop()
+	GetId() string
+	SubmitCommand(command []byte)
+	SubmitCommandBatch(commands [][]byte)
+	GetCommitChan() <-chan LogEntry
 }
 
 // NodeRole represents the state of a Raft node
@@ -149,7 +151,6 @@ func (node *raftNode) Start() {
 	go node.rpcServer.Start()
 
 	go node.listenForNewCommits()
-	go node.broadcastCommittedEntries()
 	node.running = true
 }
 
@@ -269,44 +270,6 @@ func (node *raftNode) SubmitCommandBatch(commands [][]byte) {
 	node.storage.AppendLogEntries(newEntries)
 }
 
-// Subscribe registers a client and returns a channel for committed entries
-func (node *raftNode) Subscribe(clientID string) <-chan LogEntry {
-	clientChan := make(chan LogEntry, 100)
-
-	node.clientMu.Lock()
-	node.clientChannels[clientID] = clientChan
-	node.clientMu.Unlock()
-
-	return clientChan
-}
-
-// Unsubscribe removes a client subscription
-func (node *raftNode) Unsubscribe(clientID string) {
-	node.clientMu.Lock()
-	defer node.clientMu.Unlock()
-
-	if ch, ok := node.clientChannels[clientID]; ok {
-		close(ch)
-		delete(node.clientChannels, clientID)
-	}
-}
-
-func (node *raftNode) broadcastCommittedEntries() {
-	for entry := range node.committedValuesChan {
-		node.clientMu.RLock()
-		for clientID, clientChan := range node.clientChannels {
-			select {
-			case clientChan <- entry:
-				// Entry sent successfully
-			default:
-				node.logger.Warn("Client channel full, dropping entry", "clientID", clientID)
-				// Could implement a policy to disconnect slow clients
-			}
-		}
-		node.clientMu.RUnlock()
-	}
-}
-
 func (node *raftNode) listenForNewCommits() {
 	for range node.newCommitChan {
 		node.logger.Info("[Leader] New commits detected", "node", node.id, "commitIndex", node.commitIndex)
@@ -333,4 +296,8 @@ func (node *raftNode) listenForNewCommits() {
 		}
 	}
 	node.logger.Info("listenForNewCommits finished", "node", node.id)
+}
+
+func (node *raftNode) GetCommitChan() <-chan LogEntry {
+	return node.committedValuesChan
 }

@@ -4,8 +4,6 @@ import (
 	"log/slog"
 	"testing"
 	"time"
-
-	"github.com/google/uuid"
 )
 
 func TestAppendEntriesBasic(t *testing.T) {
@@ -60,9 +58,6 @@ func TestAppendEntriesWithEntries(t *testing.T) {
 	node2.ConnectToPeers()
 
 	// Subscribe to leader's committed entries
-	clientID := uuid.New().String()
-	clientChan := node1.Subscribe(clientID)
-	defer node1.Unsubscribe(clientID)
 
 	// Start election on node1
 	node1.StartElection()
@@ -94,7 +89,7 @@ func TestAppendEntriesWithEntries(t *testing.T) {
 	}
 
 	select {
-	case entry := <-clientChan:
+	case entry := <-node1.committedValuesChan:
 		if string(entry.Command) != string(cmd1) {
 			t.Errorf("Expected command %s, got %s", cmd1, entry.Command)
 		}
@@ -103,7 +98,7 @@ func TestAppendEntriesWithEntries(t *testing.T) {
 	}
 
 	select {
-	case entry := <-clientChan:
+	case entry := <-node1.committedValuesChan:
 		if string(entry.Command) != string(cmd2) {
 			t.Errorf("Expected command %s, got %s", cmd2, entry.Command)
 		}

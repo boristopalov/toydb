@@ -3,6 +3,7 @@ package raft
 import (
 	"encoding/gob"
 	"fmt"
+	"io"
 	"os"
 	"sync"
 	"time"
@@ -24,9 +25,12 @@ type simpleDiskStorage struct {
 	mu       sync.Mutex
 	term     int
 	votedFor string
-	log      []LogEntry
-
 	basePath string
+
+	// For log entries
+	logFile *os.File
+	encoder *gob.Encoder
+	closed  bool
 }
 
 func NewSimpleDiskStorage() *simpleDiskStorage {
@@ -38,10 +42,6 @@ func NewSimpleDiskStorage() *simpleDiskStorage {
 	}
 
 	s.LoadState()
-
-	// TODO: maybe flush logs to disk periodically
-	// TODO: log compaction
-	// go s.flushLogsToDisk(1 * time.Second)
 
 	return s
 }
@@ -58,6 +58,10 @@ func (s *simpleDiskStorage) SaveState(term int, votedFor string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	if s.closed {
+		return fmt.Errorf("storage is closed")
+	}
+
 	s.term = term
 	s.votedFor = votedFor
 
@@ -68,6 +72,10 @@ func (s *simpleDiskStorage) SaveState(term int, votedFor string) error {
 func (s *simpleDiskStorage) LoadState() (term int, votedFor string, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	if s.closed {
+		return 0, "", fmt.Errorf("storage is closed")
+	}
 
 	data, err := os.ReadFile(s.stateFilePath())
 	if err != nil {
@@ -85,63 +93,133 @@ func (s *simpleDiskStorage) LoadState() (term int, votedFor string, err error) {
 	return s.term, s.votedFor, nil
 }
 
+// ensureLogFileOpen ensures the log file is open and the encoder is initialized
+// Caller must hold the mutex
+func (s *simpleDiskStorage) ensureLogFileOpen() error {
+	if s.closed {
+		return fmt.Errorf("storage is closed")
+	}
+
+	if s.logFile != nil {
+		return nil
+	}
+
+	// Open the log file in append mode
+	logFile, err := os.OpenFile(s.logFilePath(), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return err
+	}
+
+	s.logFile = logFile
+	s.encoder = gob.NewEncoder(logFile)
+	return nil
+}
+
 func (s *simpleDiskStorage) AppendLogEntries(entries []LogEntry) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	s.log = append(s.log, entries...)
-
-	// Write all logs to disk
-	file, err := os.OpenFile(s.logFilePath(), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-	if err != nil {
+	// Make sure the log file is open
+	if err := s.ensureLogFileOpen(); err != nil {
 		return err
 	}
-	defer file.Close()
 
-	encoder := gob.NewEncoder(file)
+	// Write each entry using the existing encoder
 	for _, entry := range entries {
-		if err := encoder.Encode(entry); err != nil {
+		if err := s.encoder.Encode(entry); err != nil {
 			return err
 		}
 	}
 
-	return nil
+	// Flush to ensure data is written to disk
+	return s.logFile.Sync()
 }
 
 func (s *simpleDiskStorage) GetLogEntries(startIndex, endIndex int) ([]LogEntry, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// Load logs if they haven't been loaded yet
-	if len(s.log) == 0 {
-		file, err := os.OpenFile(s.logFilePath(), os.O_RDONLY|os.O_CREATE, 0644)
-		if err != nil {
-			return nil, err
-		}
-		defer file.Close()
-
-		decoder := gob.NewDecoder(file)
-		for {
-			var entry LogEntry
-			if err := decoder.Decode(&entry); err != nil {
-				break // End of file or error
-			}
-			s.log = append(s.log, entry)
-		}
+	if s.closed {
+		return nil, fmt.Errorf("storage is closed")
 	}
 
-	if startIndex >= len(s.log) {
-		return nil, fmt.Errorf("startIndex %d out of bounds (len=%d)", startIndex, len(s.log))
+	// Read all log entries from disk
+	entries, err := s.readLogEntriesFromDisk()
+	if err != nil {
+		return nil, err
+	}
+
+	// Check bounds
+	if len(entries) == 0 || startIndex >= len(entries) {
+		return nil, fmt.Errorf("startIndex %d out of bounds (len=%d)", startIndex, len(entries))
 	}
 
 	// Handle special case for retrieving all entries
 	if endIndex == -1 {
-		return s.log[startIndex:], nil
+		return entries[startIndex:], nil
 	}
 
-	if endIndex > len(s.log) {
-		return nil, fmt.Errorf("endIndex %d out of bounds (len=%d)", endIndex, len(s.log))
+	if endIndex > len(entries) {
+		return nil, fmt.Errorf("endIndex %d out of bounds (len=%d)", endIndex, len(entries))
 	}
 
-	return s.log[startIndex:endIndex], nil
+	return entries[startIndex:endIndex], nil
+}
+
+// readLogEntriesFromDisk reads all log entries from disk
+// Caller must hold the mutex
+func (s *simpleDiskStorage) readLogEntriesFromDisk() ([]LogEntry, error) {
+	// Check if the log file exists
+	_, err := os.Stat(s.logFilePath())
+	if os.IsNotExist(err) {
+		// No log file yet, return empty log
+		return make([]LogEntry, 0), nil
+	}
+
+	// Open a separate file handle for reading
+	file, err := os.OpenFile(s.logFilePath(), os.O_RDONLY, 0644)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	// Create a decoder to read the entries
+	decoder := gob.NewDecoder(file)
+
+	// Read all entries
+	var entries []LogEntry
+	for {
+		var entry LogEntry
+		err := decoder.Decode(&entry)
+		if err == io.EOF {
+			break // End of file
+		}
+		if err != nil {
+			return nil, fmt.Errorf("error decoding log entry: %w", err)
+		}
+		entries = append(entries, entry)
+	}
+
+	return entries, nil
+}
+
+// Close closes the storage and releases any resources
+func (s *simpleDiskStorage) close() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.closed {
+		return nil // Already closed
+	}
+
+	s.closed = true
+
+	if s.logFile != nil {
+		err := s.logFile.Close()
+		s.logFile = nil
+		s.encoder = nil
+		return err
+	}
+
+	return nil
 }
