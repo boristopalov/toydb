@@ -28,10 +28,11 @@ func NewMockRaftNode() *MockRaftNode {
 	}
 }
 
-func (m *MockRaftNode) StartElection() {}
-func (m *MockRaftNode) Start()         {}
-func (m *MockRaftNode) Stop()          {}
-func (m *MockRaftNode) GetId() string  { return "mock-node" }
+func (m *MockRaftNode) StartElection()  {}
+func (m *MockRaftNode) Start()          {}
+func (m *MockRaftNode) Stop()           {}
+func (m *MockRaftNode) GetId() string   { return "mock-node" }
+func (m *MockRaftNode) ConnectToPeers() {}
 
 func (m *MockRaftNode) SubmitCommand(command []byte) {
 	m.commands = append(m.commands, command)
@@ -232,5 +233,58 @@ func TestDeduplication(t *testing.T) {
 	// Verify both GET requests returned the same value
 	if result1["value"] != result2["value"] {
 		t.Errorf("Expected same value for both GET requests, got '%s' and '%s'", result1["value"], result2["value"])
+	}
+}
+
+func TestErrorHandling(t *testing.T) {
+	// Setup
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	store := db.NewKVStore()
+	mockRaft := NewMockRaftNode()
+	server := NewRaftKVServer(store, mockRaft, logger)
+
+	// Create a test server
+	testServer := httptest.NewServer(server)
+	defer testServer.Close()
+
+	// Test GET for a non-existent key
+	req, _ := http.NewRequest("GET", testServer.URL+"/kv/non-existent-key", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("Failed to send request: %v", err)
+	}
+	defer resp.Body.Close()
+
+	// Verify that we get a 404 Not Found response
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("Expected status 404 Not Found for non-existent key, got %v", resp.Status)
+	}
+
+	// Test PUT with invalid data
+	invalidReq, _ := http.NewRequest("PUT", testServer.URL+"/kv/test-key", strings.NewReader(`{"invalid":"json"`))
+	invalidReq.Header.Set("Content-Type", "application/json")
+	invalidResp, err := http.DefaultClient.Do(invalidReq)
+	if err != nil {
+		t.Fatalf("Failed to send invalid request: %v", err)
+	}
+	defer invalidResp.Body.Close()
+
+	// Verify that we get a 400 Bad Request response
+	if invalidResp.StatusCode != http.StatusBadRequest {
+		t.Errorf("Expected status 400 Bad Request for invalid JSON, got %v", invalidResp.Status)
+	}
+
+	// Test PUT without a value field
+	missingValueReq, _ := http.NewRequest("PUT", testServer.URL+"/kv/test-key", strings.NewReader(`{"not_value":"test"}`))
+	missingValueReq.Header.Set("Content-Type", "application/json")
+	missingValueResp, err := http.DefaultClient.Do(missingValueReq)
+	if err != nil {
+		t.Fatalf("Failed to send request with missing value: %v", err)
+	}
+	defer missingValueResp.Body.Close()
+
+	// Verify that we get a 400 Bad Request response
+	if missingValueResp.StatusCode != http.StatusBadRequest {
+		t.Errorf("Expected status 400 Bad Request for missing value field, got %v", missingValueResp.Status)
 	}
 }

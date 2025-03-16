@@ -10,7 +10,7 @@ type HeartbeatSender interface {
 
 // sendHeartbeats sends AppendEntries RPCs with no entries to all peers
 func (node *raftNode) SendHeartbeats() {
-	node.logger.Info("Sending heartbeats to peers", "node", node.id)
+	// node.logger.Info("[Leader]Sending heartbeats to peers", "node", node.id)
 	for _, peerAddr := range node.peerAddrs {
 		go node.SendAppendEntries(peerAddr)
 	}
@@ -65,7 +65,7 @@ func (node *raftNode) StartAppendEntriesTimer() {
 
 		case <-node.stopChan:
 			// Node is shutting down
-			node.logger.Info("Stopping heartbeat timer", "node", node.id)
+			node.logger.Info("[Leader] Stopping heartbeat timer", "node", node.id)
 			return
 		}
 	}

@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -26,6 +27,7 @@ type Command struct {
 	Key       string `json:"key"`
 	Value     string `json:"value,omitempty"`
 	RequestID string `json:"request_id,omitempty"` // Client-provided request ID for deduplication
+	Error     string `json:"error,omitempty"`      // Error message if operation failed
 }
 
 // RaftKVServer is an HTTP server that provides access to a KVStore via Raft consensus
@@ -35,22 +37,16 @@ type RaftKVServer struct {
 	mux        *http.ServeMux
 	logger     *slog.Logger
 	clientID   string
-	pendingOps map[string]chan OpResult
+	pendingOps map[string]chan Command
 	mu         sync.Mutex
 
 	processedRequestsLock sync.RWMutex
 	// Deduplication cache
-	processedRequests map[string]OpResult // Maps request IDs to their results
+	processedRequests map[string]Command // Maps request IDs to their results
 	// Maximum number of processed requests to keep in memory
 	maxProcessedRequests int
 	// List of request IDs in order of processing (oldest first)
 	processedRequestsList []string
-}
-
-// OpResult represents the result of an operation
-type OpResult struct {
-	Value string
-	Err   error
 }
 
 // NewRaftKVServer creates a new RaftKVServer with the given KVStore and Raft node
@@ -61,8 +57,8 @@ func NewRaftKVServer(store *db.KVStore, raftNode raft.RaftNode, logger *slog.Log
 		mux:                   http.NewServeMux(),
 		logger:                logger,
 		clientID:              fmt.Sprintf("kvserver-%d", time.Now().UnixNano()),
-		pendingOps:            make(map[string]chan OpResult),
-		processedRequests:     make(map[string]OpResult),
+		pendingOps:            make(map[string]chan Command),
+		processedRequests:     make(map[string]Command),
 		maxProcessedRequests:  10000, // Keep last 10,000 processed requests
 		processedRequestsList: make([]string, 0),
 	}
@@ -95,21 +91,22 @@ func (s *RaftKVServer) handleKV(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Get request ID from header
+	// Get request ID from header or generate a new one
 	requestID := r.Header.Get("X-Request-ID")
 	if requestID == "" {
-		// Fall back to a server-generated ID if client didn't provide one
 		requestID = fmt.Sprintf("server-%d", time.Now().UnixNano())
 	}
 
 	// Check if this request has already been processed
 	if result, found := s.checkProcessedRequest(requestID); found {
-		s.logger.Info("Request already processed, returning cached result", "requestID", requestID)
-		if result.Err == db.ErrKeyNotFound {
-			http.Error(w, "Key not found", http.StatusNotFound)
+		s.logger.Info("[RaftKVServer] Request already processed, returning cached result", "requestID", requestID)
+		if result.Error != "" {
+			http.Error(w, result.Error, http.StatusInternalServerError)
 			return
-		} else if result.Err != nil {
-			http.Error(w, "Internal server error", http.StatusInternalServerError)
+		}
+
+		if result.Type == CmdGet && result.Value == "" {
+			http.Error(w, "Key not found", http.StatusNotFound)
 			return
 		}
 
@@ -141,11 +138,13 @@ func (s *RaftKVServer) handleGet(w http.ResponseWriter, r *http.Request, key, re
 	// Submit the command to Raft and wait for the result
 	result, err := s.submitAndWait(r.Context(), cmd)
 	if err != nil {
-		if err == db.ErrKeyNotFound {
+		// Check for specific error types
+		if err.Error() == db.ErrKeyNotFound.Error() {
 			http.Error(w, "Key not found", http.StatusNotFound)
 			return
 		}
-		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		s.logger.Error("[RaftKVServer] GET operation failed", "error", err)
+		http.Error(w, fmt.Sprintf("Internal server error: %v", err), http.StatusInternalServerError)
 		return
 	}
 
@@ -179,7 +178,8 @@ func (s *RaftKVServer) handlePut(w http.ResponseWriter, r *http.Request, key, re
 	// Submit the command to Raft and wait for the result
 	_, err := s.submitAndWait(r.Context(), cmd)
 	if err != nil {
-		http.Error(w, "Failed to store value", http.StatusInternalServerError)
+		s.logger.Error("[RaftKVServer] PUT operation failed", "error", err)
+		http.Error(w, fmt.Sprintf("Failed to store value: %v", err), http.StatusInternalServerError)
 		return
 	}
 
@@ -187,7 +187,7 @@ func (s *RaftKVServer) handlePut(w http.ResponseWriter, r *http.Request, key, re
 }
 
 // checkProcessedRequest checks if a request has already been processed
-func (s *RaftKVServer) checkProcessedRequest(requestID string) (OpResult, bool) {
+func (s *RaftKVServer) checkProcessedRequest(requestID string) (Command, bool) {
 	s.processedRequestsLock.RLock()
 	defer s.processedRequestsLock.RUnlock()
 
@@ -196,7 +196,7 @@ func (s *RaftKVServer) checkProcessedRequest(requestID string) (OpResult, bool) 
 }
 
 // recordProcessedRequest records a processed request and its result
-func (s *RaftKVServer) recordProcessedRequest(requestID string, result OpResult) {
+func (s *RaftKVServer) recordProcessedRequest(requestID string, result Command) {
 	s.processedRequestsLock.Lock()
 	defer s.processedRequestsLock.Unlock()
 
@@ -225,20 +225,23 @@ func (s *RaftKVServer) recordProcessedRequest(requestID string, result OpResult)
 func (s *RaftKVServer) submitAndWait(ctx context.Context, cmd Command) (string, error) {
 	// Check if this request has already been processed
 	if result, found := s.checkProcessedRequest(cmd.RequestID); found {
-		s.logger.Info("Request already processed, returning cached result", "requestID", cmd.RequestID)
-		return result.Value, result.Err
+		s.logger.Info("[RaftKVServer] Request already processed, returning cached result", "requestID", cmd.RequestID)
+		if result.Error != "" {
+			return "", errors.New(result.Error)
+		}
+		return result.Value, nil
 	}
 
 	// Generate a unique ID for this operation
 	opID := fmt.Sprintf("%s-%s-%d", cmd.Type, cmd.Key, time.Now().UnixNano())
 
 	// Create a channel to receive the result
-	resultCh := make(chan OpResult, 1)
+	resultCh := make(chan Command, 1)
 
 	// Register the pending operation
 	s.mu.Lock()
 	if _, found := s.pendingOps[opID]; found {
-		s.logger.Error("Pending operation already exists", "opID", opID)
+		s.logger.Error("[RaftKVServer] Pending operation already exists", "opID", opID)
 		s.mu.Unlock()
 		return "", fmt.Errorf("pending operation already exists")
 	}
@@ -276,10 +279,16 @@ func (s *RaftKVServer) submitAndWait(ctx context.Context, cmd Command) (string, 
 		return "", ctx.Err()
 	case result := <-resultCh:
 		// Record this request as processed
-		if cmd.RequestID != "" {
+		if cmd.RequestID != result.RequestID {
 			s.recordProcessedRequest(cmd.RequestID, result)
 		}
-		return result.Value, result.Err
+
+		// Check if there was an error
+		if result.Error != "" {
+			return "", errors.New(result.Error)
+		}
+
+		return result.Value, nil
 	}
 }
 
@@ -287,48 +296,51 @@ func (s *RaftKVServer) submitAndWait(ctx context.Context, cmd Command) (string, 
 func (s *RaftKVServer) processLogEntries(entryCh <-chan raft.LogEntry) {
 	for entry := range entryCh {
 		// Parse the command
-		var cmdWithID struct {
-			Type      string `json:"type"`
-			Key       string `json:"key"`
-			Value     string `json:"value,omitempty"`
-			RequestID string `json:"request_id,omitempty"`
-			OpID      string `json:"op_id"`
+		var cmdWithId struct {
+			Command
+			OpID string `json:"op_id"`
 		}
 
-		if err := json.Unmarshal(entry.Command, &cmdWithID); err != nil {
-			s.logger.Error("Failed to unmarshal command", "error", err)
+		if err := json.Unmarshal(entry.Command, &cmdWithId); err != nil {
+			s.logger.Error("[RaftKVServer] Failed to unmarshal command", "error", err)
 			continue
 		}
 
-		// Process the command
-		var result OpResult
-
-		switch cmdWithID.Type {
+		switch cmdWithId.Type {
 		case CmdGet:
-			value, err := s.store.Get(cmdWithID.Key)
-			result = OpResult{Value: value, Err: err}
+			value, err := s.store.Get(cmdWithId.Key)
+			if err != nil {
+				s.logger.Error("[RaftKVServer] Failed to GET value", "error", err)
+				cmdWithId.Error = err.Error()
+			} else {
+				cmdWithId.Value = value
+			}
 
 		case CmdPut:
-			err := s.store.Put(cmdWithID.Key, cmdWithID.Value)
-			result = OpResult{Err: err}
+			err := s.store.Put(cmdWithId.Key, cmdWithId.Value)
+			if err != nil {
+				s.logger.Error("[RaftKVServer] Failed to PUT value", "error", err)
+				cmdWithId.Error = err.Error()
+			}
 
 		default:
-			s.logger.Error("Unknown command type", "type", cmdWithID.Type)
+			s.logger.Error("[RaftKVServer] Unknown command type", "type", cmdWithId.Type)
+			cmdWithId.Error = fmt.Sprintf("unknown command type: %s", cmdWithId.Type)
 			continue
 		}
 
 		// If this command has a request ID, record it as processed
-		if cmdWithID.RequestID != "" {
-			s.recordProcessedRequest(cmdWithID.RequestID, result)
+		if cmdWithId.RequestID != "" {
+			s.recordProcessedRequest(cmdWithId.RequestID, cmdWithId.Command)
 		}
 
 		// If this is a command we're waiting for, send the result
-		if cmdWithID.OpID != "" {
+		if cmdWithId.OpID != "" {
 			s.mu.Lock()
-			if ch, ok := s.pendingOps[cmdWithID.OpID]; ok {
-				ch <- result
-				delete(s.pendingOps, cmdWithID.OpID)
-				s.logger.Info("Sent result to pending operation", "opID", cmdWithID.OpID)
+			if ch, ok := s.pendingOps[cmdWithId.OpID]; ok {
+				ch <- cmdWithId.Command
+				delete(s.pendingOps, cmdWithId.OpID)
+				s.logger.Info("[RaftKVServer] Sent result to pending operation", "opID", cmdWithId.OpID)
 				close(ch)
 			}
 			s.mu.Unlock()

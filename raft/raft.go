@@ -20,6 +20,7 @@ type RaftNode interface {
 	SubmitCommand(command []byte)
 	SubmitCommandBatch(commands [][]byte)
 	GetCommitChan() <-chan LogEntry
+	ConnectToPeers()
 }
 
 // NodeRole represents the state of a Raft node
@@ -38,7 +39,7 @@ const (
 // LogEntry represents a single entry in the Raft log
 type LogEntry struct {
 	Term    int
-	Index   int
+	Index   int // 1-indexed position in the log
 	Command []byte
 }
 
@@ -49,12 +50,12 @@ type raftNode struct {
 	// Persistent state
 	currentTerm int
 	votedFor    string
-	log         []LogEntry
+	log         []LogEntry // 0-indexed array, but represents 1-indexed log entries
 
 	// Volatile state
 	role        NodeRole
-	commitIndex int // Index of the highest committed log entry
-	lastApplied int // Index of the highest log entry in the state machine
+	commitIndex int // Index of the highest committed log entry (1-indexed)
+	lastApplied int // Index of the highest log entry in the state machine (1-indexed)
 
 	// Channel to notify external clients of committed entries
 	newCommitChan       chan struct{}
@@ -100,8 +101,8 @@ func NewRaftNode(id string, port string, peerAddrs []string, storage Storage, lo
 		currentTerm:         0,
 		votedFor:            "",
 		log:                 make([]LogEntry, 0),
-		commitIndex:         -1,
-		lastApplied:         -1,
+		commitIndex:         0, // 0 means no entries committed (1-indexed)
+		lastApplied:         0, // 0 means no entries applied (1-indexed)
 		nextIndex:           make(map[string]int),
 		matchIndex:          make(map[string]int),
 		resetChan:           make(chan struct{}, 1), // Buffer of 1 to avoid blocking
@@ -119,7 +120,7 @@ func NewRaftNode(id string, port string, peerAddrs []string, storage Storage, lo
 
 	term, votedFor, err := node.storage.LoadState()
 	if err != nil {
-		node.logger.Error("Failed to load state", "error", err)
+		node.logger.Error("[RaftNode] Failed to load state", "error", err)
 	} else {
 		node.currentTerm = term
 		node.votedFor = votedFor
@@ -127,7 +128,7 @@ func NewRaftNode(id string, port string, peerAddrs []string, storage Storage, lo
 	// Load log entries from disk
 	logEntries, err := node.storage.GetLogEntries(0, -1)
 	if err != nil {
-		node.logger.Error("Failed to load log entries", "error", err)
+		node.logger.Error("[RaftNode] Failed to load log entries", "error", err)
 	} else {
 		node.log = logEntries
 	}
@@ -160,11 +161,11 @@ func (node *raftNode) ConnectToPeers() {
 		for range 5 {
 			rpcClient, err := NewRaftRPCClient(peerAddr, node.logger)
 			if err != nil {
-				node.logger.Error("Failed to create RPC client", "node", node.id, "peerAddr", peerAddr, "error", err)
+				node.logger.Error("[RaftNode] Failed to create RPC client", "node", node.id, "peerAddr", peerAddr, "error", err)
 				time.Sleep(200 * time.Millisecond)
 				continue
 			}
-			node.logger.Info("Connected to peer", "node", node.id, "peerAddr", peerAddr)
+			node.logger.Info("[RaftNode] Connected to peer", "node", node.id, "peerAddr", peerAddr)
 			node.peerClients[peerAddr] = rpcClient
 
 			// Load persistent state if available
@@ -184,6 +185,13 @@ func (node *raftNode) StartElectionTimer() {
 
 // Stop stops the Raft node
 func (node *raftNode) Stop() {
+	node.logger.Info("Stopping Raft node", "id", node.id)
+
+	// First signal all goroutines to stop without holding the lock
+	// This allows any goroutines that might be waiting on the lock to proceed
+	close(node.stopChan)
+
+	// Now acquire the lock to update state
 	node.mu.Lock()
 	defer node.mu.Unlock()
 
@@ -192,13 +200,24 @@ func (node *raftNode) Stop() {
 		return
 	}
 
-	node.logger.Info("Stopping Raft node", "id", node.id)
-
-	// Signal all goroutines to stop
-	close(node.stopChan)
 	// Stop the RPC server
-	node.rpcServer.Stop()
+	if node.rpcServer != nil {
+		node.rpcServer.Stop()
+	}
+
+	// Close the newCommitChan to signal listenForNewCommits to exit
+	// Only close if not already closed
+	select {
+	case <-node.newCommitChan:
+		// Channel already closed or drained
+	default:
+		close(node.newCommitChan)
+	}
+
+	// Mark as not running
 	node.running = false
+
+	node.logger.Info("Raft node stopped", "id", node.id)
 }
 
 func (node *raftNode) GetId() string {
@@ -209,13 +228,18 @@ func (node *raftNode) SubmitCommand(command []byte) {
 	node.mu.Lock()
 
 	if node.role != Leader {
-		node.logger.Error("SubmitCommand failed", "node", node.id, "error", "not a leader")
+		node.logger.Error("[RaftNode] SubmitCommand failed", "node", node.id, "error", "not a leader")
 		node.mu.Unlock()
 		return
 	}
 
-	node.logger.Info("Submitting command", "node", node.id, "command", command)
-	newEntry := LogEntry{Term: node.currentTerm, Command: command}
+	node.logger.Info("[Leader] Submitting command", "node", node.id, "command", command)
+	// Set the Index field to the 1-indexed position in the log
+	newEntry := LogEntry{
+		Term:    node.currentTerm,
+		Index:   len(node.log) + 1, // 1-indexed position
+		Command: command,
+	}
 	node.log = append(node.log, newEntry)
 	node.mu.Unlock()
 
@@ -224,7 +248,7 @@ func (node *raftNode) SubmitCommand(command []byte) {
 		// Successfully sent command notification
 	default:
 		// Channel is full, log a warning but don't block
-		node.logger.Warn("Command channel full, AppendEntries might be delayed", "node", node.id)
+		node.logger.Warn("[Leader] Command channel full, AppendEntries might be delayed", "node", node.id)
 	}
 	node.storage.AppendLogEntries([]LogEntry{newEntry})
 }
@@ -237,18 +261,20 @@ func (node *raftNode) SubmitCommandBatch(commands [][]byte) {
 	node.mu.Lock()
 
 	if node.role != Leader {
-		node.logger.Error("SubmitCommandBatch failed", "node", node.id, "error", "not a leader", "commandCount", len(commands))
+		node.logger.Error("[RaftNode] SubmitCommandBatch failed", "node", node.id, "error", "not a leader", "commandCount", len(commands))
 		node.mu.Unlock()
 		return
 	}
 
-	node.logger.Info("Submitting command batch", "node", node.id, "commandCount", len(commands))
+	node.logger.Info("[Leader] Submitting command batch", "node", node.id, "commandCount", len(commands))
 
 	// Create log entries for all commands
 	newEntries := make([]LogEntry, len(commands))
 	for i, cmd := range commands {
+		// Set the Index field to the 1-indexed position in the log
 		newEntries[i] = LogEntry{
 			Term:    node.currentTerm,
+			Index:   len(node.log) + i + 1, // 1-indexed position
 			Command: cmd,
 		}
 	}
@@ -263,7 +289,7 @@ func (node *raftNode) SubmitCommandBatch(commands [][]byte) {
 		// Successfully sent command notification
 	default:
 		// Channel is full, log a warning but don't block
-		node.logger.Warn("Command channel full, AppendEntries might be delayed", "node", node.id, "commandCount", len(commands))
+		node.logger.Warn("[Leader] Command channel full, AppendEntries might be delayed", "node", node.id, "commandCount", len(commands))
 	}
 
 	// Persist all entries at once
@@ -271,31 +297,58 @@ func (node *raftNode) SubmitCommandBatch(commands [][]byte) {
 }
 
 func (node *raftNode) listenForNewCommits() {
-	for range node.newCommitChan {
-		node.logger.Info("[Leader] New commits detected", "node", node.id, "commitIndex", node.commitIndex)
-		node.mu.Lock()
-		currentTerm := node.currentTerm
-
-		// lastApplied is the index of the last log entry that was applied to the state machine
-		// Before this batch of commits
-		lastApplied := node.lastApplied
-		var entriesToApply []LogEntry
-		if node.commitIndex > node.lastApplied {
-			entriesToApply = node.log[node.lastApplied+1 : node.commitIndex+1]
-			node.lastApplied = node.commitIndex
-		}
-		node.mu.Unlock()
-
-		// Send committed entries to commmit channel
-		for i, entry := range entriesToApply {
-			node.committedValuesChan <- LogEntry{
-				Term:    currentTerm,
-				Index:   lastApplied + i + 1,
-				Command: entry.Command,
+	for {
+		select {
+		case _, ok := <-node.newCommitChan:
+			if !ok {
+				// Channel closed, exit the goroutine
+				node.logger.Info("[RaftNode] newCommitChan closed, exiting listenForNewCommits", "node", node.id)
+				return
 			}
+
+			node.mu.Lock()
+			node.logger.Info("[RaftNode] New commits detected", "node", node.id, "commitIndex", node.commitIndex)
+
+			// lastApplied is the index of the last log entry that was applied to the state machine
+			// Before this batch of commits
+			var entriesToApply []LogEntry
+			if node.commitIndex > node.lastApplied {
+				// For 1-indexed logs, we need to adjust array access
+				// lastApplied and commitIndex are 1-indexed, so we subtract 1 for array access
+				if node.lastApplied == 0 {
+					// No entries applied yet, start from the beginning
+					entriesToApply = node.log[:node.commitIndex]
+				} else {
+					entriesToApply = node.log[node.lastApplied:node.commitIndex]
+				}
+				node.lastApplied = node.commitIndex
+			}
+			node.mu.Unlock()
+
+			// Send committed entries to commit channel
+			for _, entry := range entriesToApply {
+				node.logger.Info("[RaftNode] Sending committed entry to commit channel", "node", node.id, "index", entry.Index)
+				// The Index field should already be set correctly when the entry was created
+				select {
+				case node.committedValuesChan <- LogEntry{
+					Term:    entry.Term,
+					Index:   entry.Index, // Already 1-indexed
+					Command: entry.Command,
+				}:
+					// Successfully sent
+				case <-node.stopChan:
+					// Node is shutting down, exit
+					node.logger.Info("[RaftNode] Shutdown detected during commit, exiting listenForNewCommits", "node", node.id)
+					return
+				}
+			}
+
+		case <-node.stopChan:
+			// Node is shutting down
+			node.logger.Info("[RaftNode] Shutdown detected, exiting listenForNewCommits", "node", node.id)
+			return
 		}
 	}
-	node.logger.Info("listenForNewCommits finished", "node", node.id)
 }
 
 func (node *raftNode) GetCommitChan() <-chan LogEntry {

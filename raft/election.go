@@ -115,7 +115,7 @@ func (node *raftNode) StartElection() {
 					// Check if we have majority and are still a candidate in the same term
 					if newVotes >= int32(neededVotes) && node.role == Candidate && node.currentTerm == term {
 						node.logger.Info("Received majority of votes, becoming leader", "node", node.id)
-						node.BecomeLeader()
+						node.becomeLeader()
 					}
 				}
 			}
@@ -123,18 +123,21 @@ func (node *raftNode) StartElection() {
 	}
 }
 
-// BecomeLeader transitions a candidate to leader
-func (node *raftNode) BecomeLeader() {
+// becomeLeader transitions a candidate to leader
+func (node *raftNode) becomeLeader() {
 	node.role = Leader
 
 	node.storage.SaveState(node.currentTerm, node.votedFor)
 
 	// Initialize leader state
 	for _, peerAddr := range node.peerAddrs {
-		// When a leader is elected, it sets the nextIndex for all peers to the length of the log.
+		// When a leader is elected, it sets the nextIndex for all peers to the index after the last entry.
 		// This ensures that sending AppendEntries to all peers will not fail due to mismatch in log index.
 		// This limits the number of entries that can be sent to a peer to the number of entries in the new leader's log
-		node.nextIndex[peerAddr] = len(node.log)
+		// For 1-indexed logs, nextIndex should be len(log) + 1
+		node.nextIndex[peerAddr] = len(node.log) + 1
+		// matchIndex is initialized to 0, which is correct for 1-indexed logs
+		// (0 means no entries are known to be replicated)
 		node.matchIndex[peerAddr] = 0
 	}
 
