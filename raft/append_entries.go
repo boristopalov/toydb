@@ -29,15 +29,26 @@ type AppendEntriesReply struct {
 
 // AppendEntries handles the AppendEntries RPC from a leader
 func (node *raftNode) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) error {
+	node.logger.Info("[Follower] Received AppendEntries", "node", node.id, "term", args.Term, "prevLogIndex", args.PrevLogIndex, "prevLogTerm", args.PrevLogTerm, "leaderId", args.LeaderId, "leaderCommit", args.LeaderCommit)
 	node.mu.Lock()
-	defer node.mu.Unlock()
+	defer func() {
+		node.mu.Unlock()
+		node.logger.Info("[Follower] AppendEntries unlocked", "node", node.id)
+	}()
+	node.logger.Info("[Follower] AppendEntries locked", "node", node.id)
 
 	// Initialize reply with current term
 	reply.Term = node.currentTerm
 	reply.Success = false
 
+	if !node.running {
+		node.logger.Info("[Follower] AppendEntries failed", "node", node.id, "reason", "node is not running")
+		return errors.New("node is not running")
+	}
+
 	// 1. Reply false if term < currentTerm (§5.1)
 	if args.Term < node.currentTerm {
+		node.logger.Info("[Follower] AppendEntries failed", "node", node.id, "reason", "term is less than current term")
 		return errors.New("term is less than current term")
 	}
 
@@ -95,6 +106,7 @@ func (node *raftNode) AppendEntries(args *AppendEntriesArgs, reply *AppendEntrie
 	// delete the existing entry and all that follow it (§5.3).
 	// Append any new entries not already in the log
 	newEntries := make([]LogEntry, 0)
+	node.logger.Info("[Follower] Appending entries", "node", node.id, "prevLogIndex", args.PrevLogIndex, "entries", len(args.Entries))
 	for i, entry := range args.Entries {
 		// Calculate 1-indexed logical position
 		logIndex := args.PrevLogIndex + 1 + i
@@ -125,16 +137,11 @@ func (node *raftNode) AppendEntries(args *AppendEntriesArgs, reply *AppendEntrie
 	// 4. If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
 	// this happens when the leader has committed new entries
 	if args.LeaderCommit > node.commitIndex {
+		node.logger.Info("[Follower] Leader has committed new entries", "node", node.id, "leaderCommit", args.LeaderCommit, "commitIndex", node.commitIndex)
 		lastNewIndex := args.PrevLogIndex + len(args.Entries)
 		node.commitIndex = min(args.LeaderCommit, lastNewIndex)
-		// node.logger.Info("[Follower] CommitIndex updated", "node", node.id, "commitIndex", node.commitIndex)
-		select {
-		case node.newCommitChan <- struct{}{}:
-			// Successfully sent
-		default:
-			// Channel is full or closed, log and continue
-			node.logger.Warn("[Follower] Failed to send to newCommitChan, channel might be full or closed", "node", node.id)
-		}
+		node.newCommitChan <- struct{}{}
+		node.logger.Info("[Follower] Sent new commit signal", "node", node.id, "leaderCommit", args.LeaderCommit, "commitIndex", node.commitIndex)
 	}
 
 	reply.Success = true
@@ -270,28 +277,15 @@ func (node *raftNode) SendAppendEntries(peerId string) *AppendEntriesReply {
 		// Used to notify external clients of newly committed entries
 		// and to immediately send AppendEntries to the follower with the newly committed entries
 		if node.commitIndex > prevCommitIndex {
-			// Use non-blocking sends to avoid deadlocks during shutdown
-			// don't think we need to unlock here but whatev
+			// Unlock before sending to avoid deadlocks
 			node.mu.Unlock()
-			select {
-			case node.newCommitChan <- struct{}{}:
-				// Successfully sent
-			default:
-				// Channel is full or closed, log and continue
-				node.logger.Warn("[Leader] Failed to send to newCommitChan, channel might be full or closed", "node", node.id)
-			}
-
-			select {
-			case node.commandChan <- struct{}{}:
-				// Successfully sent
-			default:
-				// Channel is full or closed, log and continue
-				node.logger.Warn("[Leader] Failed to send to commandChan, channel might be full or closed", "node", node.id)
-			}
+			node.newCommitChan <- struct{}{}
+			node.commandChan <- struct{}{}
 		} else {
 			node.mu.Unlock()
 		}
 
+		node.logger.Info("[Leader] Done processing AppendEntries reply")
 		return reply
 	} else {
 		// AppendEntries failed because of log inconsistency
@@ -305,6 +299,7 @@ func (node *raftNode) SendAppendEntries(peerId string) *AppendEntriesReply {
 			node.nextIndex[peerId] = prevLogIndex
 		}
 		node.mu.Unlock()
+		node.logger.Info("[Leader] Done processing AppendEntries reply")
 		return reply
 	}
 }

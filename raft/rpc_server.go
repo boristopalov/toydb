@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/rpc"
 	"sync"
+	"time"
 )
 
 // RaftRPC is the RPC handler for Raft operations
@@ -25,15 +26,22 @@ type RaftRPCServer struct {
 	logger   *slog.Logger
 	mu       sync.Mutex
 	running  bool
+	wg       sync.WaitGroup
+
+	// Track active connections
+	connMu      sync.Mutex
+	connections map[net.Conn]struct{}
 }
 
 // NewRaftRPCServer creates a new RPC server for a Raft node
 func NewRaftRPCServer(node *raftNode, port string, logger *slog.Logger) *RaftRPCServer {
 	return &RaftRPCServer{
-		node:    node,
-		port:    port,
-		logger:  logger,
-		running: false,
+		node:        node,
+		port:        port,
+		logger:      logger,
+		running:     false,
+		wg:          sync.WaitGroup{},
+		connections: make(map[net.Conn]struct{}),
 	}
 }
 
@@ -74,7 +82,9 @@ func (s *RaftRPCServer) Start() (string, error) {
 	s.logger.Info("Started RPC server", "address", listener.Addr().String())
 
 	// Handle connections in a goroutine
+	s.wg.Add(1)
 	go func() {
+		defer s.wg.Done()
 		for {
 			// Check if we should stop accepting connections
 			s.mu.Lock()
@@ -99,7 +109,25 @@ func (s *RaftRPCServer) Start() (string, error) {
 				}
 				continue
 			}
-			go s.server.ServeConn(conn)
+
+			// Track the connection
+			s.connMu.Lock()
+			s.connections[conn] = struct{}{}
+			s.connMu.Unlock()
+
+			s.wg.Add(1)
+			go func(conn net.Conn) {
+				defer func() {
+					// Remove the connection from tracking
+					s.connMu.Lock()
+					delete(s.connections, conn)
+					s.connMu.Unlock()
+
+					s.wg.Done()
+				}()
+
+				s.server.ServeConn(conn)
+			}(conn)
 		}
 	}()
 
@@ -109,18 +137,40 @@ func (s *RaftRPCServer) Start() (string, error) {
 // Stop stops the RPC server
 func (s *RaftRPCServer) Stop() {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	if !s.running {
+		s.mu.Unlock()
 		return
 	}
 
 	s.running = false
-	s.logger.Info("Stopping RPC server")
+	s.mu.Unlock()
+
+	// Close all active connections
+	s.connMu.Lock()
+	for conn := range s.connections {
+		s.logger.Info("Closing active connection", "remote", conn.RemoteAddr().String())
+		conn.Close()
+	}
+	s.connMu.Unlock()
 
 	// Close the listener to stop accepting new connections
 	if s.listener != nil {
 		s.listener.Close()
+	}
+
+	// Set a timeout for waiting
+	done := make(chan struct{})
+	go func() {
+		s.wg.Wait()
+		close(done)
+	}()
+
+	// Wait with timeout
+	select {
+	case <-done:
+		s.logger.Info("RPC server stopped gracefully", "address", s.listener.Addr().String())
+	case <-time.After(5 * time.Second):
+		s.logger.Warn("RPC server stop timed out, some goroutines may still be running", "address", s.listener.Addr().String())
 	}
 }
 

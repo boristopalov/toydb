@@ -58,8 +58,9 @@ type raftNode struct {
 	lastApplied int // Index of the highest log entry in the state machine (1-indexed)
 
 	// Channel to notify external clients of committed entries
-	newCommitChan       chan struct{}
-	committedValuesChan chan LogEntry
+	newCommitChan          chan struct{}
+	processingNewCommitsWg sync.WaitGroup
+	committedValuesChan    chan LogEntry
 
 	// Client subscriptions
 	clientChannels map[string]chan LogEntry
@@ -94,28 +95,29 @@ type raftNode struct {
 // NewRaftNode creates a new Raft node
 func NewRaftNode(id string, port string, peerAddrs []string, storage Storage, logger *slog.Logger) *raftNode {
 	node := &raftNode{
-		id:                  id,
-		peerAddrs:           peerAddrs,
-		storage:             storage,
-		role:                Follower,
-		currentTerm:         0,
-		votedFor:            "",
-		log:                 make([]LogEntry, 0),
-		commitIndex:         0, // 0 means no entries committed (1-indexed)
-		lastApplied:         0, // 0 means no entries applied (1-indexed)
-		nextIndex:           make(map[string]int),
-		matchIndex:          make(map[string]int),
-		resetChan:           make(chan struct{}, 1), // Buffer of 1 to avoid blocking
-		stopChan:            make(chan struct{}),
-		commandChan:         make(chan struct{}, 1), // Buffer of 1 to avoid blocking
-		peerClients:         make(map[string]RaftClient),
-		newCommitChan:       make(chan struct{}, 1), // Buffer of 1 to avoid blocking
-		committedValuesChan: make(chan LogEntry),
-		clientChannels:      make(map[string]chan LogEntry),
-		clientMu:            sync.RWMutex{},
-		running:             false,
-		port:                port,
-		logger:              logger,
+		id:                     id,
+		peerAddrs:              peerAddrs,
+		storage:                storage,
+		role:                   Follower,
+		currentTerm:            0,
+		votedFor:               "",
+		log:                    make([]LogEntry, 0),
+		commitIndex:            0, // 0 means no entries committed (1-indexed)
+		lastApplied:            0, // 0 means no entries applied (1-indexed)
+		nextIndex:              make(map[string]int),
+		matchIndex:             make(map[string]int),
+		resetChan:              make(chan struct{}, 1), // Buffer of 1 to avoid blocking
+		stopChan:               make(chan struct{}),
+		commandChan:            make(chan struct{}, 1), // Buffer of 1 to avoid blocking
+		peerClients:            make(map[string]RaftClient),
+		newCommitChan:          make(chan struct{}, 10), // Buffer of 100 to avoid blocking
+		processingNewCommitsWg: sync.WaitGroup{},
+		committedValuesChan:    make(chan LogEntry),
+		clientChannels:         make(map[string]chan LogEntry),
+		clientMu:               sync.RWMutex{},
+		running:                false,
+		port:                   port,
+		logger:                 logger,
 	}
 
 	term, votedFor, err := node.storage.LoadState()
@@ -151,6 +153,7 @@ func (node *raftNode) Start() {
 
 	go node.rpcServer.Start()
 
+	node.processingNewCommitsWg.Add(1)
 	go node.listenForNewCommits()
 	node.running = true
 }
@@ -187,36 +190,51 @@ func (node *raftNode) StartElectionTimer() {
 func (node *raftNode) Stop() {
 	node.logger.Info("Stopping Raft node", "id", node.id)
 
-	// First signal all goroutines to stop without holding the lock
-	// This allows any goroutines that might be waiting on the lock to proceed
-	close(node.stopChan)
-
-	// Now acquire the lock to update state
+	// First check if we're already stopped
 	node.mu.Lock()
-	defer node.mu.Unlock()
-
 	if !node.running {
 		node.logger.Info("Raft node already stopped", "id", node.id)
+		node.mu.Unlock()
 		return
 	}
 
-	// Stop the RPC server
+	node.running = false
+
+	// Close all RPC client connections first
+	for peerAddr, client := range node.peerClients {
+		node.logger.Info("Closing RPC client connection", "id", node.id, "peer", peerAddr)
+		if err := client.Close(); err != nil {
+			node.logger.Error("Error closing RPC client connection", "id", node.id, "peer", peerAddr, "error", err)
+		}
+	}
+
+	node.mu.Unlock()
+
+	// Signal all goroutines to stop
+	close(node.stopChan)
+
 	if node.rpcServer != nil {
+		node.logger.Info("Stopping Raft RPC server", "id", node.id)
 		node.rpcServer.Stop()
 	}
 
 	// Close the newCommitChan to signal listenForNewCommits to exit
-	// Only close if not already closed
-	select {
-	case <-node.newCommitChan:
-		// Channel already closed or drained
-	default:
-		close(node.newCommitChan)
-	}
+	node.logger.Info("Closing newCommitChan", "id", node.id)
+	close(node.newCommitChan)
 
-	// Mark as not running
-	node.running = false
+	// Now wait for the goroutine to finish
+	node.logger.Info("Waiting for processingNewCommitsWg to finish", "id", node.id)
+	node.processingNewCommitsWg.Wait()
+	node.logger.Info("ProcessingNewCommitsWg finished", "id", node.id)
 
+	// Close the command channel
+	// node.logger.Info("Closing commandChan", "id", node.id)
+	// close(node.commandChan)
+
+	// // Close the committedValuesChan after all processing is done
+	// node.logger.Info("Closing committedValuesChan", "id", node.id)
+	// close(node.committedValuesChan)
+	// Stop the RPC server first to prevent new requests
 	node.logger.Info("Raft node stopped", "id", node.id)
 }
 
@@ -297,58 +315,43 @@ func (node *raftNode) SubmitCommandBatch(commands [][]byte) {
 }
 
 func (node *raftNode) listenForNewCommits() {
-	for {
-		select {
-		case _, ok := <-node.newCommitChan:
-			if !ok {
-				// Channel closed, exit the goroutine
-				node.logger.Info("[RaftNode] newCommitChan closed, exiting listenForNewCommits", "node", node.id)
-				return
+	defer node.processingNewCommitsWg.Done()
+	node.logger.Info("[RaftNode] listenForNewCommits starting", "node", node.id)
+	for range node.newCommitChan {
+		node.logger.Info("[RaftNode] listenForNewCommits Acquiring lock", "node", node.id)
+		node.mu.Lock()
+		node.logger.Info("[RaftNode] listenForNewCommits Acquired lock", "node", node.id)
+
+		// lastApplied is the index of the last log entry that was applied to the state machine
+		// Before this batch of commits
+		var entriesToApply []LogEntry
+		if node.commitIndex > node.lastApplied {
+			// For 1-indexed logs, we need to adjust array access
+			// lastApplied and commitIndex are 1-indexed, so we subtract 1 for array access
+			if node.lastApplied == 0 {
+				// No entries applied yet, start from the beginning
+				entriesToApply = node.log[:node.commitIndex]
+			} else {
+				entriesToApply = node.log[node.lastApplied:node.commitIndex]
 			}
-
-			node.mu.Lock()
-			node.logger.Info("[RaftNode] New commits detected", "node", node.id, "commitIndex", node.commitIndex)
-
-			// lastApplied is the index of the last log entry that was applied to the state machine
-			// Before this batch of commits
-			var entriesToApply []LogEntry
-			if node.commitIndex > node.lastApplied {
-				// For 1-indexed logs, we need to adjust array access
-				// lastApplied and commitIndex are 1-indexed, so we subtract 1 for array access
-				if node.lastApplied == 0 {
-					// No entries applied yet, start from the beginning
-					entriesToApply = node.log[:node.commitIndex]
-				} else {
-					entriesToApply = node.log[node.lastApplied:node.commitIndex]
-				}
-				node.lastApplied = node.commitIndex
-			}
-			node.mu.Unlock()
-
-			// Send committed entries to commit channel
-			for _, entry := range entriesToApply {
-				node.logger.Info("[RaftNode] Sending committed entry to commit channel", "node", node.id, "index", entry.Index)
-				// The Index field should already be set correctly when the entry was created
-				select {
-				case node.committedValuesChan <- LogEntry{
-					Term:    entry.Term,
-					Index:   entry.Index, // Already 1-indexed
-					Command: entry.Command,
-				}:
-					// Successfully sent
-				case <-node.stopChan:
-					// Node is shutting down, exit
-					node.logger.Info("[RaftNode] Shutdown detected during commit, exiting listenForNewCommits", "node", node.id)
-					return
-				}
-			}
-
-		case <-node.stopChan:
-			// Node is shutting down
-			node.logger.Info("[RaftNode] Shutdown detected, exiting listenForNewCommits", "node", node.id)
-			return
+			node.lastApplied = node.commitIndex
 		}
+		node.mu.Unlock()
+		// node.logger.Info("[RaftNode] listenForNewCommits Released lock", "node", node.id)
+
+		// Send committed entries to commit channel
+		for _, entry := range entriesToApply {
+			node.logger.Info("[RaftNode] listenForNewCommits sending committed entry to commit channel", "node", node.id)
+			// The Index field should already be set correctly when the entry was created
+			node.committedValuesChan <- LogEntry{
+				Term:    entry.Term,
+				Index:   entry.Index, // Already 1-indexed
+				Command: entry.Command,
+			}
+		}
+		node.logger.Info("[RaftNode] listenForNewCommits sent committed entries to commit channel", "node", node.id)
 	}
+	node.logger.Info("[RaftNode] listenForNewCommits finished", "node", node.id)
 }
 
 func (node *raftNode) GetCommitChan() <-chan LogEntry {

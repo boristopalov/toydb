@@ -11,6 +11,7 @@ import (
 type RaftClient interface {
 	SendRequestVote(args *RequestVoteArgs) (*RequestVoteReply, error)
 	SendAppendEntries(args *AppendEntriesArgs) (*AppendEntriesReply, error)
+	Close() error
 }
 
 // RaftRPCClient manages outbound RPC connections to other Raft nodes
@@ -51,4 +52,12 @@ func (rc *rpcClient) SendAppendEntries(args *AppendEntriesArgs) (*AppendEntriesR
 	reply := &AppendEntriesReply{}
 	err := rc.client.Call("RaftServer.AppendEntries", args, reply)
 	return reply, err
+}
+
+// Close closes the RPC client connection
+func (rc *rpcClient) Close() error {
+	if rc.client != nil {
+		return rc.client.Close()
+	}
+	return nil
 }
