@@ -31,6 +31,15 @@ type simpleDiskStorage struct {
 	logFile *os.File
 	encoder *gob.Encoder
 	closed  bool
+
+	// In-memory cache of log entries
+	logEntries []LogEntry
+
+	// Sync control
+	lastSyncTime     time.Time
+	syncInterval     time.Duration
+	pendingWrites    int
+	maxPendingWrites int
 }
 
 func NewSimpleDiskStorage() *simpleDiskStorage {
@@ -38,10 +47,23 @@ func NewSimpleDiskStorage() *simpleDiskStorage {
 	dir := fmt.Sprintf("raft-%s-%s", time.Now().Format("20060102150405"), uuid.New().String())
 	os.MkdirAll(dir, 0755)
 	s := &simpleDiskStorage{
-		basePath: dir,
+		basePath:         dir,
+		logEntries:       make([]LogEntry, 0, 1000), // Pre-allocate some capacity
+		syncInterval:     250 * time.Millisecond,    // Sync at most every 100ms
+		lastSyncTime:     time.Now(),
+		maxPendingWrites: 500, // Sync after 500 writes
 	}
 
 	s.LoadState()
+
+	// Load existing log entries into memory
+	entries, err := s.readLogEntriesFromDisk()
+	if err == nil {
+		s.logEntries = entries
+	}
+
+	// Ensure log file is open for writing
+	s.ensureLogFileOpen()
 
 	return s
 }
@@ -129,10 +151,29 @@ func (s *simpleDiskStorage) AppendLogEntries(entries []LogEntry) error {
 		if err := s.encoder.Encode(entry); err != nil {
 			return err
 		}
+
+		// Add to in-memory cache
+		s.logEntries = append(s.logEntries, entry)
 	}
 
-	// Flush to ensure data is written to disk
-	return s.logFile.Sync()
+	// Increment pending writes counter
+	s.pendingWrites += len(entries)
+
+	// Determine if we should sync to disk
+	shouldSync := s.pendingWrites >= s.maxPendingWrites ||
+		time.Since(s.lastSyncTime) >= s.syncInterval
+
+	// Only sync to disk periodically to improve performance
+	if shouldSync {
+		err := s.logFile.Sync()
+		if err != nil {
+			return err
+		}
+		s.lastSyncTime = time.Now()
+		s.pendingWrites = 0
+	}
+
+	return nil
 }
 
 func (s *simpleDiskStorage) GetLogEntries(startIndex, endIndex int) ([]LogEntry, error) {
@@ -143,11 +184,8 @@ func (s *simpleDiskStorage) GetLogEntries(startIndex, endIndex int) ([]LogEntry,
 		return nil, fmt.Errorf("storage is closed")
 	}
 
-	// Read all log entries from disk
-	entries, err := s.readLogEntriesFromDisk()
-	if err != nil {
-		return nil, err
-	}
+	// Use in-memory cache instead of reading from disk
+	entries := s.logEntries
 
 	// Check bounds
 	if len(entries) == 0 || startIndex >= len(entries) {
@@ -203,7 +241,7 @@ func (s *simpleDiskStorage) readLogEntriesFromDisk() ([]LogEntry, error) {
 	return entries, nil
 }
 
-// Close closes the storage and releases any resources
+// close closes the storage and releases any resources
 func (s *simpleDiskStorage) close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -215,6 +253,11 @@ func (s *simpleDiskStorage) close() error {
 	s.closed = true
 
 	if s.logFile != nil {
+		// Make sure to sync any pending writes before closing
+		if s.pendingWrites > 0 {
+			s.logFile.Sync()
+		}
+
 		err := s.logFile.Close()
 		s.logFile = nil
 		s.encoder = nil

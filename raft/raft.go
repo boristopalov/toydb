@@ -1,6 +1,7 @@
 package raft
 
 import (
+	"context"
 	"log/slog"
 	"sync"
 	"time"
@@ -34,6 +35,10 @@ const (
 	Follower NodeRole = iota
 	Candidate
 	Leader
+
+	// Command batching settings
+	batchInterval = 6 * time.Millisecond // Maximum time to wait before submitting a batch
+	maxBatchSize  = 100                  // Maximum number of commands in a batch
 )
 
 // LogEntry represents a single entry in the Raft log
@@ -41,6 +46,169 @@ type LogEntry struct {
 	Term    int
 	Index   int // 1-indexed position in the log
 	Command []byte
+}
+
+// commandBatcher collects commands and submits them in batches
+type commandBatcher struct {
+	mu            sync.Mutex
+	commands      [][]byte
+	timer         *time.Timer
+	node          *raftNode
+	batchInterval time.Duration
+	maxBatchSize  int
+	closed        bool
+	pendingBatch  bool
+	stopChan      chan struct{}
+}
+
+// newCommandBatcher creates a new command batcher
+func newCommandBatcher(node *raftNode, batchInterval time.Duration, maxBatchSize int) *commandBatcher {
+	batcher := &commandBatcher{
+		commands:      make([][]byte, 0, maxBatchSize),
+		node:          node,
+		batchInterval: batchInterval,
+		maxBatchSize:  maxBatchSize,
+		stopChan:      make(chan struct{}),
+	}
+
+	// Start the timer with a very long duration initially (it will be reset when commands are added)
+	// basically the batcher remains idle until work arrives
+	batcher.timer = time.NewTimer(24 * time.Hour)
+
+	// Start the background goroutine that processes batches
+	go batcher.processBatches()
+
+	return batcher
+}
+
+// add adds a command to the batch
+func (b *commandBatcher) add(command []byte) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if b.closed {
+		return
+	}
+
+	// Add the command to the batch
+	b.commands = append(b.commands, command)
+
+	// If this is the first command in the batch, reset the timer
+	if len(b.commands) == 1 {
+		// Stop the timer if it's running
+		if !b.timer.Stop() {
+			// If the timer has already fired, drain the channel
+			select {
+			case <-b.timer.C:
+			default:
+			}
+		}
+		// Reset the timer
+		b.timer.Reset(b.batchInterval)
+	}
+
+	// If we've reached the maximum batch size, submit immediately
+	if len(b.commands) >= b.maxBatchSize {
+		b.submitBatch()
+	}
+}
+
+// submitBatch submits the current batch of commands
+// Caller must hold the mutex
+func (b *commandBatcher) submitBatch() {
+	if len(b.commands) == 0 || b.pendingBatch {
+		return
+	}
+
+	// Mark that we're processing a batch
+	b.pendingBatch = true
+
+	// Make a copy of the commands
+	commands := make([][]byte, len(b.commands))
+	copy(commands, b.commands)
+
+	// Clear the batch
+	b.commands = b.commands[:0]
+
+	// Submit the batch in a separate goroutine to avoid blocking
+	go func() {
+		// Check if we're closed before submitting
+		select {
+		case <-b.stopChan:
+			// We're closed, don't submit
+			b.mu.Lock()
+			b.pendingBatch = false
+			b.mu.Unlock()
+			return
+		default:
+			// Not closed, continue
+		}
+
+		b.node.SubmitCommandBatch(commands)
+
+		// Mark that we're done processing this batch
+		b.mu.Lock()
+		b.pendingBatch = false
+
+		// Check if more commands accumulated while we were processing
+		if len(b.commands) > 0 && !b.closed {
+			b.submitBatch()
+		}
+		b.mu.Unlock()
+	}()
+}
+
+// processBatches processes batches when the timer expires
+func (b *commandBatcher) processBatches() {
+	for {
+		select {
+		case <-b.timer.C:
+			// Submit the current batch
+			b.mu.Lock()
+			if b.closed {
+				b.mu.Unlock()
+				return
+			}
+			b.submitBatch()
+			// Reset the timer with a very long duration (it will be reset when commands are added)
+			b.timer.Reset(24 * time.Hour)
+			b.mu.Unlock()
+		case <-b.stopChan:
+			return
+		}
+	}
+}
+
+// close closes the batcher and submits any pending commands
+func (b *commandBatcher) close() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if b.closed {
+		return
+	}
+
+	b.closed = true
+	close(b.stopChan)
+
+	// Stop the timer to prevent it from firing after we're closed
+	if !b.timer.Stop() {
+		// Drain the channel if the timer has already fired
+		select {
+		case <-b.timer.C:
+		default:
+		}
+	}
+
+	// Submit any pending commands
+	if len(b.commands) > 0 && !b.pendingBatch {
+		commands := make([][]byte, len(b.commands))
+		copy(commands, b.commands)
+		b.commands = nil
+
+		// Submit synchronously since we're shutting down
+		b.node.SubmitCommandBatch(commands)
+	}
 }
 
 // RaftNode represents a node in the Raft cluster
@@ -86,8 +254,14 @@ type raftNode struct {
 	// Command channel to tell the leader to send AppendEntries
 	commandChan chan struct{}
 
+	// Command batcher
+	batcher *commandBatcher
+
 	// Running state
 	running bool
+
+	// Shutdown coordination
+	shutdownWg sync.WaitGroup
 
 	logger *slog.Logger
 }
@@ -119,6 +293,9 @@ func NewRaftNode(id string, port string, peerAddrs []string, storage Storage, lo
 		port:                   port,
 		logger:                 logger,
 	}
+
+	// Initialize the command batcher
+	node.batcher = newCommandBatcher(node, batchInterval, maxBatchSize)
 
 	term, votedFor, err := node.storage.LoadState()
 	if err != nil {
@@ -186,9 +363,13 @@ func (node *raftNode) StartElectionTimer() {
 	go node.startElectionTimer()
 }
 
-// Stop stops the Raft node
+// Stop stops the Raft node with a graceful shutdown sequence
 func (node *raftNode) Stop() {
 	node.logger.Info("Stopping Raft node", "id", node.id)
+
+	// Create a context with timeout for the entire shutdown process
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
 
 	node.mu.Lock()
 	// First check if we're already stopped
@@ -198,43 +379,87 @@ func (node *raftNode) Stop() {
 		return
 	}
 
+	// Mark as not running first to prevent new operations
 	node.running = false
+	node.mu.Unlock()
 
-	// Close all RPC client connections first
+	// Signal all goroutines to stop
+	close(node.stopChan)
+
+	// Phase 1: Stop accepting new commands
+	node.logger.Info("[Shutdown] Phase 1: Stopping command processing", "id", node.id)
+
+	// Close the command batcher
+	if node.batcher != nil {
+		node.batcher.close()
+	}
+
+	// Phase 2: Wait for in-flight operations to complete with timeout
+	node.logger.Info("[Shutdown] Phase 2: Waiting for in-flight operations", "id", node.id)
+
+	// Create a done channel for timeout handling
+	done := make(chan struct{})
+
+	// Wait for in-flight operations in a separate goroutine
+	go func() {
+		// Wait a moment for goroutines to notice the stop signal
+		time.Sleep(100 * time.Millisecond)
+		close(done)
+	}()
+
+	// Wait with timeout
+	select {
+	case <-done:
+		// In-flight operations completed
+	case <-ctx.Done():
+		node.logger.Warn("[Shutdown] Timeout waiting for in-flight operations", "id", node.id)
+	}
+
+	// Phase 3: Close network connections
+	node.logger.Info("[Shutdown] Phase 3: Closing network connections", "id", node.id)
+
+	node.mu.Lock()
+	// Close all RPC client connections
 	for peerAddr, client := range node.peerClients {
 		node.logger.Info("Closing RPC client connection", "id", node.id, "peer", peerAddr)
 		if err := client.Close(); err != nil {
 			node.logger.Error("Error closing RPC client connection", "id", node.id, "peer", peerAddr, "error", err)
 		}
 	}
-
 	node.mu.Unlock()
 
-	// Signal all goroutines to stop
-	close(node.stopChan)
-
+	// Stop the RPC server
 	if node.rpcServer != nil {
 		node.logger.Info("Stopping Raft RPC server", "id", node.id)
 		node.rpcServer.Stop()
 	}
 
+	// Phase 4: Close internal channels and wait for goroutines
+	node.logger.Info("[Shutdown] Phase 4: Closing internal channels", "id", node.id)
+
 	// Close the newCommitChan to signal listenForNewCommits to exit
-	node.logger.Info("Closing newCommitChan", "id", node.id)
 	close(node.newCommitChan)
 
-	// Now wait for the goroutine to finish
-	node.logger.Info("Waiting for processingNewCommitsWg to finish", "id", node.id)
-	node.processingNewCommitsWg.Wait()
-	node.logger.Info("ProcessingNewCommitsWg finished", "id", node.id)
+	// Wait for the commit processing goroutine with timeout
+	waitDone := make(chan struct{})
+	go func() {
+		node.processingNewCommitsWg.Wait()
+		close(waitDone)
+	}()
 
-	// Close the command channel
-	// node.logger.Info("Closing commandChan", "id", node.id)
-	// close(node.commandChan)
+	select {
+	case <-waitDone:
+		node.logger.Info("ProcessingNewCommitsWg finished", "id", node.id)
+	case <-ctx.Done():
+		node.logger.Warn("[Shutdown] Timeout waiting for commit processing", "id", node.id)
+	}
 
-	// // Close the committedValuesChan after all processing is done
-	// node.logger.Info("Closing committedValuesChan", "id", node.id)
-	// close(node.committedValuesChan)
-	// Stop the RPC server first to prevent new requests
+	// Phase 5: Final cleanup
+	node.logger.Info("[Shutdown] Phase 5: Final cleanup", "id", node.id)
+
+	// Close the committedValuesChan last, after all producers have stopped
+	close(node.committedValuesChan)
+
 	node.logger.Info("Raft node stopped", "id", node.id)
 }
 
@@ -244,39 +469,75 @@ func (node *raftNode) GetId() string {
 
 func (node *raftNode) SubmitCommand(command []byte) {
 	node.mu.Lock()
-
-	if node.role != Leader {
-		node.logger.Error("[RaftNode] SubmitCommand failed", "node", node.id, "error", "not a leader")
+	// Check if node is still running
+	if !node.running {
+		node.logger.Warn("[RaftNode] SubmitCommand called on stopped node", "node", node.id)
 		node.mu.Unlock()
 		return
 	}
 
-	node.logger.Info("[Leader] Submitting command", "node", node.id, "command", command)
-	// Set the Index field to the 1-indexed position in the log
-	newEntry := LogEntry{
-		Term:    node.currentTerm,
-		Index:   len(node.log) + 1, // 1-indexed position
-		Command: command,
+	isLeader := node.role == Leader
+
+	// Fast path for single commands when the system is not under high load
+	// This bypasses the batcher for better latency in low-concurrency scenarios
+	if isLeader && node.batcher != nil && len(node.commandChan) == 0 {
+		// Create a new log entry directly
+		newEntry := LogEntry{
+			Term:    node.currentTerm,
+			Index:   len(node.log) + 1, // 1-indexed position
+			Command: command,
+		}
+		node.log = append(node.log, newEntry)
+		node.mu.Unlock()
+
+		// Notify about the new command
+		select {
+		case node.commandChan <- struct{}{}:
+			// Successfully sent command notification
+		case <-node.stopChan:
+			// Node is stopping, don't send on commandChan
+			return
+		default:
+			// Channel is full, fall back to batching
+			if node.running {
+				node.batcher.add(command)
+			}
+			return
+		}
+
+		// Persist the entry
+		if err := node.storage.AppendLogEntries([]LogEntry{newEntry}); err != nil {
+			node.logger.Error("[RaftNode] Failed to persist log entry", "node", node.id, "error", err)
+		}
+		return
 	}
-	node.log = append(node.log, newEntry)
+
 	node.mu.Unlock()
 
-	select {
-	case node.commandChan <- struct{}{}:
-		// Successfully sent command notification
-	default:
-		// Channel is full, log a warning but don't block
-		node.logger.Warn("[Leader] Command channel full, AppendEntries might be delayed", "node", node.id)
+	if !isLeader {
+		node.logger.Error("[RaftNode] SubmitCommand failed", "node", node.id, "error", "not a leader")
+		return
 	}
-	node.storage.AppendLogEntries([]LogEntry{newEntry})
+
+	// Add the command to the batcher (fallback path for high concurrency)
+	if node.running {
+		node.batcher.add(command)
+	}
 }
 
+// SubmitCommandBatch submits a batch of commands
 func (node *raftNode) SubmitCommandBatch(commands [][]byte) {
 	if len(commands) == 0 {
 		return // Nothing to do
 	}
 
 	node.mu.Lock()
+	// Check if node is still running
+	if !node.running {
+		node.logger.Warn("[RaftNode] SubmitCommandBatch called on stopped node", "node", node.id)
+		node.mu.Unlock()
+		return
+	}
 
 	if node.role != Leader {
 		node.logger.Error("[RaftNode] SubmitCommandBatch failed", "node", node.id, "error", "not a leader", "commandCount", len(commands))
@@ -299,19 +560,58 @@ func (node *raftNode) SubmitCommandBatch(commands [][]byte) {
 
 	// Append all entries to the log
 	node.log = append(node.log, newEntries...)
+
+	// Store the current log length to check if we need to trigger AppendEntries
+	logLength := len(node.log)
 	node.mu.Unlock()
+
+	// Persist all entries at once
+	if err := node.storage.AppendLogEntries(newEntries); err != nil {
+		node.logger.Error("[RaftNode] Failed to persist log entries", "node", node.id, "error", err, "entryCount", len(newEntries))
+	}
 
 	// Notify about new commands (only once for the whole batch)
 	select {
 	case node.commandChan <- struct{}{}:
 		// Successfully sent command notification
+	case <-node.stopChan:
+		// Node is stopping, don't send on commandChan
+		return
 	default:
-		// Channel is full, log a warning but don't block
-		node.logger.Warn("[Leader] Command channel full, AppendEntries might be delayed", "node", node.id, "commandCount", len(commands))
-	}
+		// Channel is full, but we still need to ensure AppendEntries is triggered
+		// Check if we need to force an AppendEntries RPC
+		node.mu.Lock()
+		currentLogLength := len(node.log)
+		isLeader := node.role == Leader
+		node.mu.Unlock()
 
-	// Persist all entries at once
-	node.storage.AppendLogEntries(newEntries)
+		if isLeader && currentLogLength == logLength {
+			// The log hasn't changed since we added our entries, and we're still the leader
+			// This means our notification might have been lost, so force an AppendEntries
+			go func() {
+				// Small delay to allow potential in-flight AppendEntries to complete
+				time.Sleep(3 * time.Millisecond)
+
+				// Check again if we're still the leader and if AppendEntries is needed
+				node.mu.Lock()
+				isStillLeader := node.role == Leader && node.running
+				node.mu.Unlock()
+
+				if isStillLeader {
+					select {
+					case node.commandChan <- struct{}{}:
+						// Successfully sent command notification
+					case <-node.stopChan:
+						// Node is stopping
+					default:
+						// Channel still full, log a warning
+						node.logger.Warn("[Leader] Command channel still full, AppendEntries might be delayed",
+							"node", node.id, "commandCount", len(commands))
+					}
+				}
+			}()
+		}
+	}
 }
 
 func (node *raftNode) listenForNewCommits() {

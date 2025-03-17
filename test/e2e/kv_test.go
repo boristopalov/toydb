@@ -15,7 +15,7 @@ import (
 )
 
 // setupTestRaftCluster creates a test Raft cluster with three nodes
-func setupTestRaftCluster(t *testing.T) ([]raft.RaftNode, *db.KVStore, []*server.RaftKVServer, []string) {
+func setupTestRaftCluster(t *testing.T, nodeCount int) ([]raft.RaftNode, *db.KVStore, []*server.RaftKVServer, []string) {
 	t.Helper()
 
 	// Setup logger
@@ -25,8 +25,6 @@ func setupTestRaftCluster(t *testing.T) ([]raft.RaftNode, *db.KVStore, []*server
 
 	// Create KV store
 	store := db.NewKVStore()
-
-	nodeCount := 3
 
 	// Base ports for Raft and HTTP
 	baseRaftPort := 8090
@@ -84,7 +82,7 @@ func setupTestRaftCluster(t *testing.T) ([]raft.RaftNode, *db.KVStore, []*server
 // TestBasicGetPut tests basic Get and Put operations
 func TestBasicGetPut(t *testing.T) {
 	// Setup test cluster
-	raftNodes, _, _, httpAddrs := setupTestRaftCluster(t)
+	raftNodes, _, _, httpAddrs := setupTestRaftCluster(t, 3)
 	defer func() {
 		for _, node := range raftNodes {
 			node.Stop()
@@ -119,7 +117,7 @@ func TestBasicGetPut(t *testing.T) {
 // TestKeyNotFound tests the behavior when a key is not found
 func TestKeyNotFound(t *testing.T) {
 	// Setup test cluster
-	raftNodes, _, _, httpAddrs := setupTestRaftCluster(t)
+	raftNodes, _, _, httpAddrs := setupTestRaftCluster(t, 3)
 	defer func() {
 		for _, node := range raftNodes {
 			node.Stop()
@@ -150,7 +148,7 @@ func TestKeyNotFound(t *testing.T) {
 // TestMultipleOperations tests a sequence of operations
 func TestMultipleOperations(t *testing.T) {
 	// Setup test cluster
-	raftNodes, _, _, httpAddrs := setupTestRaftCluster(t)
+	raftNodes, _, _, httpAddrs := setupTestRaftCluster(t, 3)
 	defer func() {
 		for _, node := range raftNodes {
 			node.Stop()

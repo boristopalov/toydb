@@ -10,6 +10,8 @@ import (
 	"net/http"
 	"sync/atomic"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 // Common errors
@@ -30,7 +32,7 @@ type RaftKVClient struct {
 // NewRaftKVClient creates a new client for the key-value database
 func NewRaftKVClient(serverURL string, timeout time.Duration) *RaftKVClient {
 	// Generate a unique client ID using timestamp
-	clientID := fmt.Sprintf("client-%d", time.Now().UnixNano())
+	clientID := fmt.Sprintf("client-%s", uuid.New().String())
 
 	return &RaftKVClient{
 		baseURL: serverURL,

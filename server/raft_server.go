@@ -9,10 +9,11 @@ import (
 	"net/http"
 	"strings"
 	"sync"
-	"time"
 
 	"toydb/db"
 	"toydb/raft"
+
+	"github.com/google/uuid"
 )
 
 // Command types
@@ -57,7 +58,7 @@ func NewRaftKVServer(store *db.KVStore, raftNode raft.RaftNode, logger *slog.Log
 		raftNode:              raftNode,
 		mux:                   http.NewServeMux(),
 		logger:                logger,
-		clientID:              fmt.Sprintf("kvserver-%d", time.Now().UnixNano()),
+		clientID:              fmt.Sprintf("kvserver-%s", uuid.New().String()),
 		pendingOps:            make(map[string]chan Command),
 		processedRequests:     make(map[string]Command),
 		maxProcessedRequests:  10000, // Keep last 10,000 processed requests
@@ -95,7 +96,7 @@ func (s *RaftKVServer) handleKV(w http.ResponseWriter, r *http.Request) {
 	// Get request ID from header or generate a new one
 	requestID := r.Header.Get("X-Request-ID")
 	if requestID == "" {
-		requestID = fmt.Sprintf("server-%d", time.Now().UnixNano())
+		requestID = fmt.Sprintf("server-%s", uuid.New().String())
 	}
 
 	// Check if this request has already been processed
@@ -234,7 +235,7 @@ func (s *RaftKVServer) submitAndWait(ctx context.Context, cmd Command) (string, 
 	}
 
 	// Generate a unique ID for this operation
-	opID := fmt.Sprintf("%s-%s-%d", cmd.Type, cmd.Key, time.Now().UnixNano())
+	opID := fmt.Sprintf("%s-%s-%s", cmd.Type, cmd.Key, uuid.New().String())
 
 	// Create a channel to receive the result
 	resultCh := make(chan Command, 1)

@@ -2,16 +2,11 @@ package e2e
 
 import (
 	"context"
-	"fmt"
-	"log/slog"
-	"os"
 	"testing"
 	"time"
 
+	"maps"
 	"toydb/client"
-	"toydb/db"
-	"toydb/raft"
-	"toydb/server"
 )
 
 // TestBasicFaultTolerance tests that the system continues to function when a minority of nodes fail
@@ -22,10 +17,10 @@ func TestBasicFaultTolerance(t *testing.T) {
 	}
 
 	// Setup test cluster with 5 nodes (can tolerate 2 failures)
-	raftNodes, _, _, httpAddr := setupMultiNodeTestRaftCluster(t, 5)
+	raftNodes, _, _, httpAddr := setupTestRaftCluster(t, 5)
 
 	// Create client
-	apiClient := client.NewRaftKVClient("http://localhost"+httpAddr, 5*time.Second)
+	apiClient := client.NewRaftKVClient("http://localhost"+httpAddr[0], 5*time.Second)
 
 	// Test context
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -63,7 +58,7 @@ func TestBasicFaultTolerance(t *testing.T) {
 	raftNodes[4].Stop()
 
 	// Wait a bit for the cluster to stabilize
-	time.Sleep(1 * time.Second)
+	time.Sleep(300 * time.Millisecond)
 
 	// The cluster should still function with 3 out of 5 nodes
 	// Put some more data
@@ -81,12 +76,8 @@ func TestBasicFaultTolerance(t *testing.T) {
 
 	// Verify all data (both initial and additional)
 	allData := make(map[string]string)
-	for k, v := range initialData {
-		allData[k] = v
-	}
-	for k, v := range additionalData {
-		allData[k] = v
-	}
+	maps.Copy(allData, initialData)
+	maps.Copy(allData, additionalData)
 
 	for k, expectedValue := range allData {
 		value, err := apiClient.Get(ctx, k)
@@ -111,67 +102,20 @@ func TestLeaderFailover(t *testing.T) {
 		t.Skip("Skipping leader failover test in short mode")
 	}
 
-	// This test requires a custom setup where we can control which node is the leader
-	// and then create a new server with a different leader after failover
-
-	// Setup logger
-	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
-		Level: slog.LevelInfo,
-	}))
-
-	// Create KV store
-	store := db.NewKVStore()
-
-	// Base ports for Raft and HTTP
-	baseRaftPort := 9100
-	httpPort := 4100
-	httpAddr := fmt.Sprintf(":%d", httpPort)
-
-	// Create 3 Raft nodes
-	nodeCount := 3
-	peerAddrs := make([]string, nodeCount)
-	for i := 0; i < nodeCount; i++ {
-		peerAddrs[i] = fmt.Sprintf("localhost:%d", baseRaftPort+i)
-	}
-
-	// Create Raft nodes
-	raftNodes := make([]raft.RaftNode, nodeCount)
-	for i := 0; i < nodeCount; i++ {
-		// Filter out self from peer list
-		var nodePeers []string
-		for j, addr := range peerAddrs {
-			if j != i {
-				nodePeers = append(nodePeers, addr)
-			}
-		}
-
-		nodeID := fmt.Sprintf("failover-node-%d", i)
-		port := fmt.Sprintf("%d", baseRaftPort+i)
-		raftNodes[i] = raft.NewRaftNode(nodeID, port, nodePeers, raft.NewSimpleDiskStorage(), logger)
-		raftNodes[i].Start()
-	}
+	// Setup test cluster with 3 nodes
+	raftNodes, _, _, httpAddrs := setupTestRaftCluster(t, 3)
 
 	// Start election on first node to make it the leader
 	raftNodes[0].StartElection()
 
 	// Wait for leader election
-	time.Sleep(1 * time.Second)
-
-	// Create server with the first node (which should be the leader)
-	kvServer := server.NewRaftKVServer(store, raftNodes[0], logger)
-
-	// Start server in a goroutine
-	go func() {
-		if err := kvServer.Start(httpAddr); err != nil {
-			t.Logf("Server stopped: %v", err)
-		}
-	}()
+	time.Sleep(200 * time.Millisecond)
 
 	// Wait for server to start
-	time.Sleep(500 * time.Millisecond)
+	time.Sleep(200 * time.Millisecond)
 
 	// Create client
-	apiClient := client.NewRaftKVClient("http://localhost"+httpAddr, 5*time.Second)
+	apiClient := client.NewRaftKVClient("http://localhost"+httpAddrs[0], 5*time.Second)
 
 	// Test context
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -197,32 +141,13 @@ func TestLeaderFailover(t *testing.T) {
 	raftNodes[0].Stop()
 
 	// Wait for a new leader to be elected
-	time.Sleep(2 * time.Second)
-
-	// Create a new server with node 1 (which should now be the leader)
-	// We need to stop the old server first
-	// In a real system, we would detect leader changes and update the server
-
-	// Create a new HTTP port for the new server
-	newHttpPort := 4101
-	newHttpAddr := fmt.Sprintf(":%d", newHttpPort)
-
-	// Create a new server with node 1
-	newKvServer := server.NewRaftKVServer(store, raftNodes[1], logger)
-
-	// Start the new server in a goroutine
-	go func() {
-		if err := newKvServer.Start(newHttpAddr); err != nil {
-			t.Logf("New server stopped: %v", err)
-		}
-	}()
-
-	// Wait for the new server to start
 	time.Sleep(500 * time.Millisecond)
 
 	// Create a new client for the new server
-	newApiClient := client.NewRaftKVClient("http://localhost"+newHttpAddr, 5*time.Second)
+	newApiClient := client.NewRaftKVClient("http://localhost"+httpAddrs[1], 5*time.Second)
 
+	// We don't know which node is the new leader,
+	// but if we send a message to a follower, it will be redirected to the leader
 	// Verify that the data is still accessible with the new leader
 	newValue, err := newApiClient.Get(ctx, "leader-key")
 	if err != nil {
@@ -250,21 +175,4 @@ func TestLeaderFailover(t *testing.T) {
 	// Clean up
 	raftNodes[1].Stop()
 	raftNodes[2].Stop()
-}
-
-// TestNetworkPartition tests the system's behavior during a network partition
-// Note: This is a simplified simulation of a network partition
-func TestNetworkPartition(t *testing.T) {
-	// Skip this test as it requires more complex setup to simulate network partitions
-	// In a real test, we would need to control the network connections between nodes
-	t.Skip("Skipping network partition test as it requires more complex setup")
-
-	// In a real implementation, we would:
-	// 1. Create a cluster with 5 nodes
-	// 2. Put some data
-	// 3. Simulate a network partition by preventing communication between two groups of nodes
-	// 4. Verify that the majority partition continues to function
-	// 5. Verify that the minority partition cannot make progress
-	// 6. Heal the partition
-	// 7. Verify that the system recovers and all nodes are consistent
 }

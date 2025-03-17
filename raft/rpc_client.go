@@ -57,7 +57,16 @@ func (rc *rpcClient) SendAppendEntries(args *AppendEntriesArgs) (*AppendEntriesR
 // Close closes the RPC client connection
 func (rc *rpcClient) Close() error {
 	if rc.client != nil {
-		return rc.client.Close()
+		rc.logger.Debug("Closing RPC client connection", "endpoint", rc.endpoint)
+		err := rc.client.Close()
+		if err != nil {
+			rc.logger.Error("Error closing RPC client connection", "endpoint", rc.endpoint, "error", err)
+		} else {
+			rc.logger.Debug("RPC client connection closed successfully", "endpoint", rc.endpoint)
+		}
+		// Set client to nil to prevent double-close
+		rc.client = nil
+		return err
 	}
 	return nil
 }

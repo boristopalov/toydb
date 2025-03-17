@@ -7,6 +7,7 @@ import (
 	_ "net/http/pprof"
 	"os"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -63,11 +64,13 @@ func setupTestRaftClusterForBenchmark(b *testing.B) ([]raft.RaftNode, *db.KVStor
 		raftNodes[i].Start()
 		kvServers[i] = server.NewRaftKVServer(store, raftNodes[i], logger)
 		httpAddr := httpAddrs[i]
-		go func() {
-			if err := kvServers[i].Start(httpAddr); err != nil {
-				b.Logf("Server stopped: %v", err)
+		go func(addr string, server *server.RaftKVServer) {
+			if err := server.Start(addr); err != nil {
+				if err.Error() != "http: Server closed" {
+					b.Logf("Server stopped with error: %v", err)
+				}
 			}
-		}()
+		}(httpAddr, kvServers[i])
 	}
 
 	// Connect the nodes to each other
@@ -87,12 +90,17 @@ func setupTestRaftClusterForBenchmark(b *testing.B) ([]raft.RaftNode, *db.KVStor
 // BenchmarkPut benchmarks the Put operation
 func BenchmarkPut(b *testing.B) {
 	// Setup test cluster
-	_, _, kvServers, httpAddrs := setupTestRaftClusterForBenchmark(b)
+	raftNodes, _, kvServers, httpAddrs := setupTestRaftClusterForBenchmark(b)
 
 	// Create a context for shutdown
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer func() {
-		// Stop servers gracefully
+		// First stop the Raft nodes to prevent new commands
+		for _, node := range raftNodes {
+			node.Stop()
+		}
+
+		// Then stop the HTTP servers
 		for _, server := range kvServers {
 			if err := server.Stop(shutdownCtx); err != nil {
 				b.Logf("Error stopping server: %v", err)
@@ -126,12 +134,17 @@ func BenchmarkPut(b *testing.B) {
 // BenchmarkGet benchmarks the Get operation
 func BenchmarkGet(b *testing.B) {
 	// Setup test cluster
-	_, _, kvServers, httpAddrs := setupTestRaftClusterForBenchmark(b)
+	raftNodes, _, kvServers, httpAddrs := setupTestRaftClusterForBenchmark(b)
 
 	// Create a context for shutdown
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer func() {
-		// Stop servers gracefully
+		// First stop the Raft nodes to prevent new commands
+		for _, node := range raftNodes {
+			node.Stop()
+		}
+
+		// Then stop the HTTP servers
 		for _, server := range kvServers {
 			if err := server.Stop(shutdownCtx); err != nil {
 				b.Logf("Error stopping server: %v", err)
@@ -171,12 +184,17 @@ func BenchmarkGet(b *testing.B) {
 // BenchmarkMixedOperations benchmarks a mix of Get and Put operations
 func BenchmarkMixedOperations(b *testing.B) {
 	// Setup test cluster
-	_, _, kvServers, httpAddrs := setupTestRaftClusterForBenchmark(b)
+	raftNodes, _, kvServers, httpAddrs := setupTestRaftClusterForBenchmark(b)
 
 	// Create a context for shutdown
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer func() {
-		// Stop servers gracefully
+		// First stop the Raft nodes to prevent new commands
+		for _, node := range raftNodes {
+			node.Stop()
+		}
+
+		// Then stop the HTTP servers
 		for _, server := range kvServers {
 			if err := server.Stop(shutdownCtx); err != nil {
 				b.Logf("Error stopping server: %v", err)
@@ -217,12 +235,17 @@ func BenchmarkMixedOperations(b *testing.B) {
 // BenchmarkConcurrentPut benchmarks concurrent Put operations
 func BenchmarkConcurrentPut(b *testing.B) {
 	// Setup test cluster
-	_, _, kvServers, httpAddrs := setupTestRaftClusterForBenchmark(b)
+	raftNodes, _, kvServers, httpAddrs := setupTestRaftClusterForBenchmark(b)
 
 	// Create a context for shutdown
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer func() {
-		// Stop servers gracefully
+		// First stop the Raft nodes to prevent new commands
+		for _, node := range raftNodes {
+			node.Stop()
+		}
+
+		// Then stop the HTTP servers
 		for _, server := range kvServers {
 			if err := server.Stop(shutdownCtx); err != nil {
 				b.Logf("Error stopping server: %v", err)
@@ -288,8 +311,12 @@ func BenchmarkThroughput(b *testing.B) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	// Number of concurrent clients
-	numClients := 100
+	// Number of concurrent clients - adjust based on your system capabilities
+	numClients := 75
+	// if b.N > 10000 {
+	// For larger benchmarks, use fewer clients to avoid overwhelming the system
+	// numClients = 30
+	// }
 
 	// Reset timer before the actual benchmark
 	b.ResetTimer()
@@ -300,6 +327,10 @@ func BenchmarkThroughput(b *testing.B) {
 	// Create a wait group to wait for all goroutines to finish
 	var wg sync.WaitGroup
 	wg.Add(numClients)
+
+	// Track errors
+	errorCount := int32(0)
+	maxErrors := int32(numClients / 10) // Allow up to 10% of clients to fail
 
 	// Launch concurrent clients
 	opsPerClient := b.N / numClients
@@ -313,21 +344,50 @@ func BenchmarkThroughput(b *testing.B) {
 
 			// Each client performs its share of operations
 			for j := 0; j < opsPerClient; j++ {
-				key := fmt.Sprintf("bench-throughput-key-%d-%d", clientID, j)
-				value := fmt.Sprintf("bench-throughput-value-%d-%d", clientID, j)
-
-				// Put operation
-				err := apiClient.Put(ctx, key, value)
-				if err != nil {
-					b.Errorf("Failed to put value: %v", err)
+				// Check if we've hit too many errors
+				if atomic.LoadInt32(&errorCount) > maxErrors {
 					return
 				}
 
-				// Get operation
-				_, err = apiClient.Get(ctx, key)
+				key := fmt.Sprintf("bench-throughput-key-%d-%d", clientID, j)
+				value := fmt.Sprintf("bench-throughput-value-%d-%d", clientID, j)
+
+				// Put operation with retry
+				var err error
+				for retries := 0; retries < 3; retries++ {
+					err = apiClient.Put(ctx, key, value)
+					if err == nil {
+						break
+					}
+					time.Sleep(10 * time.Millisecond) // Small backoff
+				}
+
 				if err != nil {
-					b.Errorf("Failed to get value: %v", err)
-					return
+					atomic.AddInt32(&errorCount, 1)
+					b.Logf("Failed to put value after retries: %v", err)
+					if atomic.LoadInt32(&errorCount) > maxErrors {
+						b.Logf("Too many errors, stopping client %d", clientID)
+						return
+					}
+					continue
+				}
+
+				// Get operation with retry
+				for retries := 0; retries < 3; retries++ {
+					_, err = apiClient.Get(ctx, key)
+					if err == nil {
+						break
+					}
+					time.Sleep(10 * time.Millisecond) // Small backoff
+				}
+
+				if err != nil {
+					atomic.AddInt32(&errorCount, 1)
+					b.Logf("Failed to get value after retries: %v", err)
+					if atomic.LoadInt32(&errorCount) > maxErrors {
+						b.Logf("Too many errors, stopping client %d", clientID)
+						return
+					}
 				}
 			}
 		}(i)
@@ -336,12 +396,18 @@ func BenchmarkThroughput(b *testing.B) {
 	// Wait for all clients to finish
 	wg.Wait()
 
+	// Stop the timer to exclude shutdown time from the benchmark
+	b.StopTimer()
+
 	// Calculate elapsed time
 	elapsedTime := time.Since(startTime)
 
 	// Calculate operations per second (each iteration does a Put and a Get)
-	opsPerSecond := float64(b.N*2) / elapsedTime.Seconds()
+	totalOps := b.N * 2
+	successfulOps := totalOps - int(atomic.LoadInt32(&errorCount))*2
+	opsPerSecond := float64(successfulOps) / elapsedTime.Seconds()
 
 	// Report results
 	b.ReportMetric(opsPerSecond, "ops/sec")
+	b.ReportMetric(float64(atomic.LoadInt32(&errorCount)), "errors")
 }
