@@ -31,11 +31,7 @@ type AppendEntriesReply struct {
 func (node *raftNode) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) error {
 	node.logger.Info("[Follower] Received AppendEntries", "node", node.id, "term", args.Term, "prevLogIndex", args.PrevLogIndex, "prevLogTerm", args.PrevLogTerm, "leaderId", args.LeaderId, "leaderCommit", args.LeaderCommit)
 	node.mu.Lock()
-	defer func() {
-		node.mu.Unlock()
-		node.logger.Info("[Follower] AppendEntries unlocked", "node", node.id)
-	}()
-	node.logger.Info("[Follower] AppendEntries locked", "node", node.id)
+	defer node.mu.Unlock()
 
 	// Initialize reply with current term
 	reply.Term = node.currentTerm
@@ -153,8 +149,8 @@ func (node *raftNode) SendAppendEntries(peerId string) *AppendEntriesReply {
 	node.mu.Lock()
 
 	currentTerm := node.currentTerm
-	// Only leaders can send AppendEntries
-	if node.role != Leader {
+
+	if node.role != Leader || !node.running {
 		node.mu.Unlock()
 		return nil
 	}
@@ -173,7 +169,6 @@ func (node *raftNode) SendAppendEntries(peerId string) *AppendEntriesReply {
 
 	// Get entries to send
 	entries := make([]LogEntry, 0)
-	node.logger.Info("[Leader] PEER NEXT INDEX", "node", node.id, "peer", peerId, "nextIndex", node.nextIndex[peerId])
 
 	// we access node.log array at index-1
 	// again because the log itself is a normal data structure and thus 0-indexed

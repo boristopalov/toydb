@@ -39,6 +39,7 @@ type RaftKVServer struct {
 	clientID   string
 	pendingOps map[string]chan Command
 	mu         sync.Mutex
+	httpServer *http.Server // Added to store HTTP server reference
 
 	processedRequestsLock sync.RWMutex
 	// Deduplication cache
@@ -350,5 +351,35 @@ func (s *RaftKVServer) processLogEntries(entryCh <-chan raft.LogEntry) {
 
 // Start starts the HTTP server on the given address
 func (s *RaftKVServer) Start(addr string) error {
-	return http.ListenAndServe(addr, s)
+	server := &http.Server{
+		Addr:    addr,
+		Handler: s,
+	}
+
+	// Store the server instance so we can shut it down later
+	s.httpServer = server
+
+	return server.ListenAndServe()
+}
+
+// Stop gracefully shuts down the HTTP server and the Raft node
+func (s *RaftKVServer) Stop(ctx context.Context) error {
+	s.logger.Info("[RaftKVServer] Shutting down server")
+
+	// First, shut down the HTTP server
+	var httpErr error
+	if s.httpServer != nil {
+		s.logger.Info("[RaftKVServer] Shutting down HTTP server")
+		httpErr = s.httpServer.Shutdown(ctx)
+		if httpErr != nil {
+			s.logger.Error("[RaftKVServer] Error shutting down HTTP server", "error", httpErr)
+		}
+	}
+
+	// Then, stop the Raft node
+	s.logger.Info("[RaftKVServer] Stopping Raft node")
+	s.raftNode.Stop()
+
+	// Return the HTTP error if there was one
+	return httpErr
 }

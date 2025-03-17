@@ -190,8 +190,8 @@ func (node *raftNode) StartElectionTimer() {
 func (node *raftNode) Stop() {
 	node.logger.Info("Stopping Raft node", "id", node.id)
 
-	// First check if we're already stopped
 	node.mu.Lock()
+	// First check if we're already stopped
 	if !node.running {
 		node.logger.Info("Raft node already stopped", "id", node.id)
 		node.mu.Unlock()
