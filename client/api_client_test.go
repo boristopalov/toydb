@@ -3,6 +3,7 @@ package client
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -10,8 +11,10 @@ import (
 )
 
 func TestKVClient(t *testing.T) {
-	// Create a test server
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	var followerServerURL string
+
+	// Create a mock follower server that will redirect to a leader
+	followerServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Check the request path and method
 		if r.URL.Path == "/kv/testkey" {
 			switch r.Method {
@@ -33,15 +36,32 @@ func TestKVClient(t *testing.T) {
 			// Return a server error
 			http.Error(w, "Internal server error", http.StatusInternalServerError)
 			return
+		} else if r.URL.Path == "/kv/redirect" {
+			// Simulate a redirect to the leader
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusTemporaryRedirect)
+			json.NewEncoder(w).Encode(map[string]string{
+				"error":     "not_leader",
+				"leader_id": "test-leader",
+				"self_id":   "test-follower",
+				"self_addr": followerServerURL,
+			})
+			return
 		}
 
 		// Default: Method not allowed
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 	}))
-	defer server.Close()
+	defer followerServer.Close()
 
-	// Create a client
-	client := NewRaftKVClient(server.URL, 5*time.Second)
+	// Store the URL after the server is created
+	followerServerURL = followerServer.URL
+
+	// Create a client with a map of server URLs
+	serverURLs := map[string]string{
+		"test-node": followerServer.URL,
+	}
+	client := NewRaftKVClient(serverURLs, "", 5*time.Second)
 
 	// Test GET operation
 	t.Run("Get existing key", func(t *testing.T) {
@@ -101,12 +121,90 @@ func TestKVClient(t *testing.T) {
 		defer slowServer.Close()
 
 		// Create a client with a very short timeout
-		shortTimeoutClient := NewRaftKVClient(slowServer.URL, 50*time.Millisecond)
+		slowServerURLs := map[string]string{
+			"slow-node": slowServer.URL,
+		}
+		shortTimeoutClient := NewRaftKVClient(slowServerURLs, "", 50*time.Millisecond)
 
 		ctx := context.Background()
 		_, err := shortTimeoutClient.Get(ctx, "testkey")
 		if err == nil {
 			t.Error("Expected timeout error, got nil")
+		}
+	})
+
+	// Test leader redirection
+	t.Run("Leader redirection", func(t *testing.T) {
+		// Create a mock leader server
+		leaderServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/kv/redirect" && r.Method == http.MethodGet {
+				// The leader should handle the same key that the follower redirected
+				w.Header().Set("Content-Type", "application/json")
+				json.NewEncoder(w).Encode(map[string]string{"value": "leader-value"})
+				return
+			}
+		}))
+		defer leaderServer.Close()
+
+		// Create a client that knows about both servers
+		redirectClient := NewRaftKVClient(map[string]string{
+			"test-follower": followerServer.URL,
+			"test-leader":   leaderServer.URL,
+		}, "test-leader", 5*time.Second)
+
+		// Try to get a key from the "redirect" endpoint, which should redirect to the leader
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		// This should work because the redirect is handled automatically
+		value, err := redirectClient.Get(ctx, "redirect")
+		if err != nil {
+			t.Errorf("Failed to follow redirect: %v", err)
+		}
+		if value != "leader-value" {
+			t.Errorf("Expected 'leader-value', got '%s'", value)
+		}
+
+		// Verify that the client learned about the leader
+		if redirectClient.CurrentLeader != "test-leader" {
+			t.Errorf("Expected current leader to be 'test-leader', got '%s'", redirectClient.CurrentLeader)
+		}
+	})
+
+	// Test with test cluster configuration
+	t.Run("Test cluster configuration", func(t *testing.T) {
+		// This simulates your setupTestRaftCluster function but just creates the client config
+
+		// Create node IDs in the same format as the test setup
+		nodeCount := 3
+		nodeIDs := make([]string, nodeCount)
+		for i := 0; i < nodeCount; i++ {
+			nodeIDs[i] = fmt.Sprintf("test-node-%d", i)
+		}
+
+		// Create HTTP addresses (for a real cluster, these would be actual server addresses)
+		httpAddrs := []string{
+			followerServer.URL,      // Use our mock server as the first node
+			"http://localhost:3091", // These are placeholders
+			"http://localhost:3092",
+		}
+
+		// Create the server URL mapping
+		serverURLs := make(map[string]string)
+		for i, nodeID := range nodeIDs {
+			serverURLs[nodeID] = httpAddrs[i]
+		}
+
+		// Create a client with initial leader being the first node
+		testClient := NewRaftKVClient(serverURLs, nodeIDs[0], 5*time.Second)
+
+		// Verify the client has the expected configuration
+		if testClient.CurrentLeader != "test-node-0" {
+			t.Errorf("Expected current leader to be 'test-node-0', got '%s'", testClient.CurrentLeader)
+		}
+
+		if len(testClient.ServerURLs) != nodeCount {
+			t.Errorf("Expected %d servers, got %d", nodeCount, len(testClient.ServerURLs))
 		}
 	})
 }

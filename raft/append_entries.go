@@ -140,6 +140,11 @@ func (node *raftNode) AppendEntries(args *AppendEntriesArgs, reply *AppendEntrie
 		node.logger.Info("[Follower] Sent new commit signal", "node", node.id, "leaderCommit", args.LeaderCommit, "commitIndex", node.commitIndex)
 	}
 
+	// When processing valid AppendEntries
+	if args.Term >= node.currentTerm {
+		node.currentLeaderId = args.LeaderId
+	}
+
 	reply.Success = true
 	return nil
 }

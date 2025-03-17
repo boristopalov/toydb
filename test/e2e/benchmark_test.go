@@ -18,7 +18,7 @@ import (
 )
 
 // setupTestRaftClusterForBenchmark creates a test Raft cluster with three nodes for benchmarking
-func setupTestRaftClusterForBenchmark(b *testing.B) ([]raft.RaftNode, *db.KVStore, []*server.RaftKVServer, []string) {
+func setupTestRaftClusterForBenchmark(b *testing.B) ([]raft.RaftNode, *db.KVStore, []*server.RaftKVServer, map[string]string) {
 	b.Helper()
 
 	// Setup logger
@@ -49,6 +49,10 @@ func setupTestRaftClusterForBenchmark(b *testing.B) ([]raft.RaftNode, *db.KVStor
 	// Create Raft nodes
 	raftNodes := make([]raft.RaftNode, nodeCount)
 	kvServers := make([]*server.RaftKVServer, nodeCount)
+
+	// Create a map of node IDs to HTTP URLs
+	serverURLs := make(map[string]string)
+
 	for i := range nodeCount {
 		// Filter out self from peer list
 		var nodePeers []string
@@ -64,6 +68,10 @@ func setupTestRaftClusterForBenchmark(b *testing.B) ([]raft.RaftNode, *db.KVStor
 		raftNodes[i].Start()
 		kvServers[i] = server.NewRaftKVServer(store, raftNodes[i], logger)
 		httpAddr := httpAddrs[i]
+
+		// Add to the map of server URLs
+		serverURLs[nodeID] = fmt.Sprintf("http://localhost%s", httpAddr)
+
 		go func(addr string, server *server.RaftKVServer) {
 			if err := server.Start(addr); err != nil {
 				if err.Error() != "http: Server closed" {
@@ -84,13 +92,13 @@ func setupTestRaftClusterForBenchmark(b *testing.B) ([]raft.RaftNode, *db.KVStor
 	// Wait for server to start
 	time.Sleep(200 * time.Millisecond)
 
-	return raftNodes, store, kvServers, httpAddrs
+	return raftNodes, store, kvServers, serverURLs
 }
 
 // BenchmarkPut benchmarks the Put operation
 func BenchmarkPut(b *testing.B) {
 	// Setup test cluster
-	raftNodes, _, kvServers, httpAddrs := setupTestRaftClusterForBenchmark(b)
+	raftNodes, _, kvServers, serverURLs := setupTestRaftClusterForBenchmark(b)
 
 	// Create a context for shutdown
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -109,8 +117,9 @@ func BenchmarkPut(b *testing.B) {
 		shutdownCancel()
 	}()
 
-	// Create client
-	apiClient := client.NewRaftKVClient("http://localhost"+httpAddrs[0], 5*time.Second)
+	// Create client with the leader ID
+	leaderID := raftNodes[0].GetId()
+	apiClient := client.NewRaftKVClient(serverURLs, leaderID, 5*time.Second)
 
 	// Test context
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
@@ -134,7 +143,7 @@ func BenchmarkPut(b *testing.B) {
 // BenchmarkGet benchmarks the Get operation
 func BenchmarkGet(b *testing.B) {
 	// Setup test cluster
-	raftNodes, _, kvServers, httpAddrs := setupTestRaftClusterForBenchmark(b)
+	raftNodes, _, kvServers, serverURLs := setupTestRaftClusterForBenchmark(b)
 
 	// Create a context for shutdown
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -153,8 +162,9 @@ func BenchmarkGet(b *testing.B) {
 		shutdownCancel()
 	}()
 
-	// Create client
-	apiClient := client.NewRaftKVClient("http://localhost"+httpAddrs[0], 5*time.Second)
+	// Create client with the leader ID
+	leaderID := raftNodes[0].GetId()
+	apiClient := client.NewRaftKVClient(serverURLs, leaderID, 5*time.Second)
 
 	// Test context with longer timeout
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
@@ -184,7 +194,7 @@ func BenchmarkGet(b *testing.B) {
 // BenchmarkMixedOperations benchmarks a mix of Get and Put operations
 func BenchmarkMixedOperations(b *testing.B) {
 	// Setup test cluster
-	raftNodes, _, kvServers, httpAddrs := setupTestRaftClusterForBenchmark(b)
+	raftNodes, _, kvServers, serverURLs := setupTestRaftClusterForBenchmark(b)
 
 	// Create a context for shutdown
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -203,8 +213,9 @@ func BenchmarkMixedOperations(b *testing.B) {
 		shutdownCancel()
 	}()
 
-	// Create client
-	apiClient := client.NewRaftKVClient("http://localhost"+httpAddrs[0], 5*time.Second)
+	// Create client with the leader ID
+	leaderID := raftNodes[0].GetId()
+	apiClient := client.NewRaftKVClient(serverURLs, leaderID, 5*time.Second)
 
 	// Test context
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -235,7 +246,7 @@ func BenchmarkMixedOperations(b *testing.B) {
 // BenchmarkConcurrentPut benchmarks concurrent Put operations
 func BenchmarkConcurrentPut(b *testing.B) {
 	// Setup test cluster
-	raftNodes, _, kvServers, httpAddrs := setupTestRaftClusterForBenchmark(b)
+	raftNodes, _, kvServers, serverURLs := setupTestRaftClusterForBenchmark(b)
 
 	// Create a context for shutdown
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -254,8 +265,9 @@ func BenchmarkConcurrentPut(b *testing.B) {
 		shutdownCancel()
 	}()
 
-	// Create client
-	apiClient := client.NewRaftKVClient("http://localhost"+httpAddrs[0], 5*time.Second)
+	// Create client with the leader ID
+	leaderID := raftNodes[0].GetId()
+	apiClient := client.NewRaftKVClient(serverURLs, leaderID, 5*time.Second)
 
 	// Test context
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -290,11 +302,15 @@ func BenchmarkThroughput(b *testing.B) {
 	}
 
 	// Setup test cluster
-	_, _, kvServers, httpAddrs := setupTestRaftClusterForBenchmark(b)
+	raftNodes, _, kvServers, serverURLs := setupTestRaftClusterForBenchmark(b)
 
 	// Create a context for shutdown
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer func() {
+		// First stop the Raft nodes to prevent new commands
+		for _, node := range raftNodes {
+			node.Stop()
+		}
 		// Stop servers gracefully
 		for _, server := range kvServers {
 			if err := server.Stop(shutdownCtx); err != nil {
@@ -304,8 +320,9 @@ func BenchmarkThroughput(b *testing.B) {
 		shutdownCancel()
 	}()
 
-	// Create client
-	apiClient := client.NewRaftKVClient("http://localhost"+httpAddrs[0], 5*time.Second)
+	// Create client with the leader ID
+	leaderID := raftNodes[0].GetId()
+	apiClient := client.NewRaftKVClient(serverURLs, leaderID, 5*time.Second)
 
 	// Test context
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)

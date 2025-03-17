@@ -17,10 +17,10 @@ func TestBasicFaultTolerance(t *testing.T) {
 	}
 
 	// Setup test cluster with 5 nodes (can tolerate 2 failures)
-	raftNodes, _, _, httpAddr := setupTestRaftCluster(t, 5)
+	raftNodes, _, _, serverURLs := setupTestRaftCluster(t, 5)
 
 	// Create client
-	apiClient := client.NewRaftKVClient("http://localhost"+httpAddr[0], 5*time.Second)
+	apiClient := client.NewRaftKVClient(serverURLs, raftNodes[0].GetId(), 5*time.Second)
 
 	// Test context
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -103,7 +103,7 @@ func TestLeaderFailover(t *testing.T) {
 	}
 
 	// Setup test cluster with 3 nodes
-	raftNodes, _, _, httpAddrs := setupTestRaftCluster(t, 3)
+	raftNodes, _, _, serverURLs := setupTestRaftCluster(t, 3)
 
 	// Start election on first node to make it the leader
 	raftNodes[0].StartElection()
@@ -115,7 +115,7 @@ func TestLeaderFailover(t *testing.T) {
 	time.Sleep(200 * time.Millisecond)
 
 	// Create client
-	apiClient := client.NewRaftKVClient("http://localhost"+httpAddrs[0], 5*time.Second)
+	apiClient := client.NewRaftKVClient(serverURLs, raftNodes[0].GetId(), 5*time.Second)
 
 	// Test context
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -143,13 +143,13 @@ func TestLeaderFailover(t *testing.T) {
 	// Wait for a new leader to be elected
 	time.Sleep(500 * time.Millisecond)
 
-	// Create a new client for the new server
-	newApiClient := client.NewRaftKVClient("http://localhost"+httpAddrs[1], 5*time.Second)
+	// Update the client to use the new leader
+	apiClient.CurrentLeader = raftNodes[1].GetId()
 
 	// We don't know which node is the new leader,
 	// but if we send a message to a follower, it will be redirected to the leader
 	// Verify that the data is still accessible with the new leader
-	newValue, err := newApiClient.Get(ctx, "leader-key")
+	newValue, err := apiClient.Get(ctx, "leader-key")
 	if err != nil {
 		t.Fatalf("Failed to get value after leader failover: %v", err)
 	}
@@ -158,13 +158,13 @@ func TestLeaderFailover(t *testing.T) {
 	}
 
 	// Put some new data with the new leader
-	err = newApiClient.Put(ctx, "new-leader-key", "new-leader-value")
+	err = apiClient.Put(ctx, "new-leader-key", "new-leader-value")
 	if err != nil {
 		t.Fatalf("Failed to put value with new leader: %v", err)
 	}
 
 	// Verify the new data
-	newValue, err = newApiClient.Get(ctx, "new-leader-key")
+	newValue, err = apiClient.Get(ctx, "new-leader-key")
 	if err != nil {
 		t.Fatalf("Failed to get new value with new leader: %v", err)
 	}

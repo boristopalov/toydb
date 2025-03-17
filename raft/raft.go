@@ -22,6 +22,7 @@ type RaftNode interface {
 	SubmitCommandBatch(commands [][]byte)
 	GetCommitChan() <-chan LogEntry
 	ConnectToPeers()
+	GetLeaderId() string
 }
 
 // NodeRole represents the state of a Raft node
@@ -221,9 +222,10 @@ type raftNode struct {
 	log         []LogEntry // 0-indexed array, but represents 1-indexed log entries
 
 	// Volatile state
-	role        NodeRole
-	commitIndex int // Index of the highest committed log entry (1-indexed)
-	lastApplied int // Index of the highest log entry in the state machine (1-indexed)
+	role            NodeRole
+	commitIndex     int // Index of the highest committed log entry (1-indexed)
+	lastApplied     int // Index of the highest log entry in the state machine (1-indexed)
+	currentLeaderId string
 
 	// Channel to notify external clients of committed entries
 	newCommitChan          chan struct{}
@@ -259,9 +261,6 @@ type raftNode struct {
 
 	// Running state
 	running bool
-
-	// Shutdown coordination
-	shutdownWg sync.WaitGroup
 
 	logger *slog.Logger
 }
@@ -656,4 +655,18 @@ func (node *raftNode) listenForNewCommits() {
 
 func (node *raftNode) GetCommitChan() <-chan LogEntry {
 	return node.committedValuesChan
+}
+
+// GetLeaderId returns the ID of the current leader, or an empty string if there is no known leader
+func (node *raftNode) GetLeaderId() string {
+	node.mu.Lock()
+	defer node.mu.Unlock()
+
+	// If this node is the leader, return its own ID
+	if node.role == Leader {
+		return node.id
+	}
+
+	// Otherwise, return the stored leader ID
+	return node.currentLeaderId
 }

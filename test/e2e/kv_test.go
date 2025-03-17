@@ -15,7 +15,7 @@ import (
 )
 
 // setupTestRaftCluster creates a test Raft cluster with three nodes
-func setupTestRaftCluster(t *testing.T, nodeCount int) ([]raft.RaftNode, *db.KVStore, []*server.RaftKVServer, []string) {
+func setupTestRaftCluster(t *testing.T, nodeCount int) ([]raft.RaftNode, *db.KVStore, []*server.RaftKVServer, map[string]string) {
 	t.Helper()
 
 	// Setup logger
@@ -43,6 +43,10 @@ func setupTestRaftCluster(t *testing.T, nodeCount int) ([]raft.RaftNode, *db.KVS
 	// Create Raft nodes
 	raftNodes := make([]raft.RaftNode, nodeCount)
 	kvServers := make([]*server.RaftKVServer, nodeCount)
+
+	// Create a map of node IDs to HTTP URLs
+	serverURLs := make(map[string]string)
+
 	for i := range nodeCount {
 		// Filter out self from peer list
 		var nodePeers []string
@@ -58,6 +62,10 @@ func setupTestRaftCluster(t *testing.T, nodeCount int) ([]raft.RaftNode, *db.KVS
 		raftNodes[i].Start()
 		kvServers[i] = server.NewRaftKVServer(store, raftNodes[i], logger)
 		httpAddr := httpAddrs[i]
+
+		// Add to the map of server URLs
+		serverURLs[nodeID] = fmt.Sprintf("http://localhost%s", httpAddr)
+
 		go func() {
 			if err := kvServers[i].Start(httpAddr); err != nil {
 				t.Logf("Server stopped: %v", err)
@@ -76,21 +84,22 @@ func setupTestRaftCluster(t *testing.T, nodeCount int) ([]raft.RaftNode, *db.KVS
 	// Wait longer for the node to become a leader
 	time.Sleep(200 * time.Millisecond)
 
-	return raftNodes, store, kvServers, httpAddrs
+	return raftNodes, store, kvServers, serverURLs
 }
 
 // TestBasicGetPut tests basic Get and Put operations
 func TestBasicGetPut(t *testing.T) {
 	// Setup test cluster
-	raftNodes, _, _, httpAddrs := setupTestRaftCluster(t, 3)
+	raftNodes, _, _, serverURLs := setupTestRaftCluster(t, 3)
 	defer func() {
 		for _, node := range raftNodes {
 			node.Stop()
 		}
 	}()
 
-	// Create client
-	apiClient := client.NewRaftKVClient("http://localhost"+httpAddrs[0], 5*time.Second)
+	// Create client with the leader ID
+	leaderID := raftNodes[0].GetId()
+	apiClient := client.NewRaftKVClient(serverURLs, leaderID, 5*time.Second)
 
 	// Test context
 	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
@@ -117,15 +126,16 @@ func TestBasicGetPut(t *testing.T) {
 // TestKeyNotFound tests the behavior when a key is not found
 func TestKeyNotFound(t *testing.T) {
 	// Setup test cluster
-	raftNodes, _, _, httpAddrs := setupTestRaftCluster(t, 3)
+	raftNodes, _, _, serverURLs := setupTestRaftCluster(t, 3)
 	defer func() {
 		for _, node := range raftNodes {
 			node.Stop()
 		}
 	}()
 
-	// Create client
-	apiClient := client.NewRaftKVClient("http://localhost"+httpAddrs[0], 5*time.Second)
+	// Create client with the leader ID
+	leaderID := raftNodes[0].GetId()
+	apiClient := client.NewRaftKVClient(serverURLs, leaderID, 5*time.Second)
 
 	// Test context
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -148,15 +158,16 @@ func TestKeyNotFound(t *testing.T) {
 // TestMultipleOperations tests a sequence of operations
 func TestMultipleOperations(t *testing.T) {
 	// Setup test cluster
-	raftNodes, _, _, httpAddrs := setupTestRaftCluster(t, 3)
+	raftNodes, _, _, serverURLs := setupTestRaftCluster(t, 3)
 	defer func() {
 		for _, node := range raftNodes {
 			node.Stop()
 		}
 	}()
 
-	// Create client
-	apiClient := client.NewRaftKVClient("http://localhost"+httpAddrs[0], 5*time.Second)
+	// Create client with the leader ID
+	leaderID := raftNodes[0].GetId()
+	apiClient := client.NewRaftKVClient(serverURLs, leaderID, 5*time.Second)
 
 	// Test context
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -214,4 +225,46 @@ func TestMultipleOperations(t *testing.T) {
 	}
 
 	// Get all logs
+}
+
+func TestLeaderRedirect(t *testing.T) {
+	// Setup test cluster
+	raftNodes, _, _, serverURLs := setupTestRaftCluster(t, 3)
+	defer func() {
+		for _, node := range raftNodes {
+			node.Stop()
+		}
+	}()
+
+	// Create client for a follower node (not setting the leader ID initially)
+	apiClient := client.NewRaftKVClient(serverURLs, "", 5*time.Second)
+
+	// Test context
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	// Test Put - this should cause a redirect and update the client's leader ID internally
+	err := apiClient.Put(ctx, "test-key", "test-value")
+	if err != nil {
+		if _, ok := err.(*client.LeaderRedirectErr); ok {
+			// Update the client to use the new leader
+			apiClient.CurrentLeader = err.(*client.LeaderRedirectErr).LeaderID
+
+			t.Fatalf("Expected to automatically handle LeaderRedirectErr, got %v", err)
+		} else {
+			t.Fatalf("Failed to put value: %v", err)
+		}
+	}
+
+	// The client should now know about the leader internally
+	// Test Get using the updated leader knowledge
+	value, err := apiClient.Get(ctx, "test-key")
+	if err != nil {
+		t.Fatalf("Failed to get value: %v", err)
+	}
+
+	// Verify value
+	if value != "test-value" {
+		t.Errorf("Expected value 'test-value', got '%s'", value)
+	}
 }

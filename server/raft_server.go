@@ -41,6 +41,7 @@ type RaftKVServer struct {
 	pendingOps map[string]chan Command
 	mu         sync.Mutex
 	httpServer *http.Server // Added to store HTTP server reference
+	httpAddr   string       // The HTTP address this server is listening on
 
 	processedRequestsLock sync.RWMutex
 	// Deduplication cache
@@ -115,6 +116,30 @@ func (s *RaftKVServer) handleKV(w http.ResponseWriter, r *http.Request) {
 		// Return the cached result
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]string{"value": result.Value})
+		return
+	}
+
+	// Check if this node is the leader
+	leaderId := s.raftNode.GetLeaderId()
+	nodeId := s.raftNode.GetId()
+
+	// If this node is not the leader and we know who the leader is, redirect
+	if nodeId != leaderId && leaderId != "" {
+		// We're not the leader - respond with a redirect
+		s.logger.Info("[RaftKVServer] Redirecting request to leader",
+			"requestID", requestID,
+			"selfId", nodeId,
+			"leaderId", leaderId)
+
+		// Return a JSON response with the leader information
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusTemporaryRedirect)
+		json.NewEncoder(w).Encode(map[string]string{
+			"error":     "not_leader",
+			"leader_id": leaderId,
+			"self_id":   nodeId,
+			"self_addr": s.httpAddr,
+		})
 		return
 	}
 
@@ -352,6 +377,7 @@ func (s *RaftKVServer) processLogEntries(entryCh <-chan raft.LogEntry) {
 
 // Start starts the HTTP server on the given address
 func (s *RaftKVServer) Start(addr string) error {
+	s.httpAddr = addr
 	server := &http.Server{
 		Addr:    addr,
 		Handler: s,

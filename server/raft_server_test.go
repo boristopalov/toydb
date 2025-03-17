@@ -33,6 +33,9 @@ func (m *MockRaftNode) Start()          {}
 func (m *MockRaftNode) Stop()           {}
 func (m *MockRaftNode) GetId() string   { return "mock-node" }
 func (m *MockRaftNode) ConnectToPeers() {}
+func (m *MockRaftNode) GetLeaderId() string {
+	return ""
+}
 
 func (m *MockRaftNode) SubmitCommand(command []byte) {
 	m.commands = append(m.commands, command)
