@@ -1,10 +1,4 @@
-# ToyDB End-to-End Tests
-
-This directory contains end-to-end tests for the ToyDB Raft-based key-value database.
-
 ## Test Structure
-
-The tests are organized as follows:
 
 - `e2e/kv_test.go`: Basic tests for key-value operations
 - `e2e/advanced_test.go`: Advanced tests for concurrent operations and error handling
@@ -23,17 +17,6 @@ go test -v ./test/e2e -run TestKeyNotFound
 go test -v ./test/e2e -run TestMultipleOperations
 ```
 
-### Advanced Tests
-
-To run the advanced tests:
-
-```bash
-go test -v ./test/e2e -run TestConcurrentOperations
-go test -v ./test/e2e -run TestRequestTimeout
-go test -v ./test/e2e -run TestRequestIDDeduplication
-go test -v ./test/e2e -run TestLargeValues
-```
-
 ### Fault Tolerance Tests
 
 To run the fault tolerance tests:
@@ -42,8 +25,6 @@ To run the fault tolerance tests:
 go test -v ./test/e2e -run TestBasicFaultTolerance
 go test -v ./test/e2e -run TestLeaderFailover
 ```
-
-Note: These tests are skipped in short mode. To run them, make sure not to use the `-short` flag.
 
 ### Benchmarks
 
@@ -78,3 +59,4 @@ The tests use the following configuration:
 - The tests create temporary Raft nodes and servers that are cleaned up after each test.
 - Some tests may take longer to run due to waiting for leader election and other Raft-related operations.
 - The benchmark tests measure the performance of various operations and report metrics like operations per second.
+- Running these all concurrently worn't work as the tests all run nodes on the same ports.
